@@ -1,0 +1,669 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use chrono::Utc;
+use reqwest::Client;
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use serde_json::json;
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, SystemTime},
+};
+use sysinfo::{Disks, System};
+use tauri::{AppHandle, Manager};
+
+const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    SearchFiles,
+    GetSystemInfo,
+    ListLargeFiles,
+    GetNetworkStatus,
+    ToggleSetting,
+    ReadRecentLogs,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RiskTier {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FileFilters {
+    #[serde(rename = "type")]
+    file_type: Option<String>,
+    date_range: Option<String>,
+    size_min: Option<u64>,
+    size_max: Option<u64>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IntentParams {
+    query: Option<String>,
+    filters: Option<FileFilters>,
+    directory: Option<String>,
+    threshold_mb: Option<u64>,
+    setting_name: Option<String>,
+    value: Option<serde_json::Value>,
+    service_name: Option<String>,
+    lines: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Intent {
+    action: Action,
+    #[serde(default)]
+    params: IntentParams,
+    risk_tier: RiskTier,
+    #[serde(deserialize_with = "deserialize_confidence")]
+    confidence: f32,
+    clarification_needed: bool,
+    clarification_question: Option<String>,
+}
+
+fn deserialize_confidence<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Number(f32),
+        Label(String),
+    }
+
+    match Input::deserialize(deserializer)? {
+        Input::Number(value) => Ok(value),
+        Input::Label(label) => match label.to_lowercase().as_str() {
+            "high" => Ok(0.95),
+            "medium" => Ok(0.6),
+            "low" => Ok(0.2),
+            _ => Err(D::Error::custom("confidence must be a number from 0 to 1")),
+        },
+    }
+}
+
+#[derive(Deserialize)]
+struct OllamaResponse {
+    message: OllamaMessage,
+}
+#[derive(Deserialize)]
+struct OllamaMessage {
+    content: String,
+}
+
+fn system_prompt() -> &'static str {
+    r#"You are the intent parser for a safety-first Linux desktop assistant. Return ONLY one JSON object, with no Markdown or explanation. It must have action, params, risk_tier, confidence, clarification_needed, and clarification_question keys.
+
+Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs. Any request to open or launch an application (including File Explorer), change an unlisted setting, delete files, install software, or perform an unsupported action MUST set clarification_needed to true. Use action "search_files", params {}, risk_tier "low", confidence below 0.9, and ask the user what supported task they want instead.
+
+Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines.
+
+Use low risk only for read-only actions; medium only for toggle_setting. Params may use only query, filters, directory, threshold_mb, setting_name, value, service_name, lines. filters may use type, date_range, size_min, size_max, path. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
+}
+
+fn append_debug_log(app: &AppHandle, user_input: &str, model_output: &str) {
+    let Some(data_dir) = app.path().app_data_dir().ok() else {
+        return;
+    };
+    if std::fs::create_dir_all(&data_dir).is_err() {
+        return;
+    }
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("intent-debug.jsonl"))
+    {
+        let _ = writeln!(
+            file,
+            "{}",
+            json!({"timestamp": Utc::now().to_rfc3339(), "input": user_input, "model_output": model_output})
+        );
+    }
+}
+
+fn final_model_output(content: &str) -> &str {
+    content
+        .rsplit_once("</think>")
+        .map(|(_, answer)| answer.trim())
+        .unwrap_or_else(|| content.trim())
+}
+
+fn unsupported_app_request(request: &str) -> Option<Intent> {
+    let request = request.to_lowercase();
+    let asks_to_launch = ["open", "launch", "start", "run"]
+        .iter()
+        .any(|verb| request.contains(verb));
+    let unsupported_app = [
+        "file explorer",
+        "explorer.exe",
+        "terminal",
+        "command prompt",
+    ]
+    .iter()
+    .any(|app| request.contains(app));
+    if asks_to_launch && unsupported_app {
+        Some(Intent {
+            action: Action::SearchFiles,
+            params: IntentParams::default(),
+            risk_tier: RiskTier::Low,
+            confidence: 0.0,
+            clarification_needed: true,
+            clarification_question: Some(
+                "Opening applications is not supported in this MVP. Would you like me to search for a file instead?".to_string(),
+            ),
+        })
+    } else {
+        None
+    }
+}
+
+fn validate_intent(intent: &Intent) -> Result<(), String> {
+    if intent.confidence < 0.9 && !intent.clarification_needed {
+        return Err(
+            "Ollama returned low confidence without requesting clarification. No action was taken."
+                .to_string(),
+        );
+    }
+    if intent.clarification_needed
+        && intent
+            .clarification_question
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(
+            "Ollama requested clarification without a question. No action was taken.".to_string(),
+        );
+    }
+
+    let params = &intent.params;
+    match &intent.action {
+        Action::GetSystemInfo | Action::GetNetworkStatus
+            if params.query.is_some()
+                || params.filters.is_some()
+                || params.directory.is_some()
+                || params.threshold_mb.is_some()
+                || params.setting_name.is_some()
+                || params.value.is_some()
+                || params.service_name.is_some()
+                || params.lines.is_some() =>
+        {
+            Err("Ollama returned incompatible parameters for a read-only action. No action was taken.".to_string())
+        }
+        Action::ListLargeFiles if params.directory.is_none() || params.threshold_mb.is_none() => {
+            Err("Ollama omitted required large-file parameters. No action was taken.".to_string())
+        }
+        Action::ToggleSetting if params.setting_name.is_none() || params.value.is_none() => {
+            Err("Ollama omitted required setting parameters. No action was taken.".to_string())
+        }
+        Action::ReadRecentLogs if params.service_name.is_none() || params.lines.is_none() => {
+            Err("Ollama omitted required log parameters. No action was taken.".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[tauri::command]
+async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String> {
+    let request = request.trim();
+    if request.is_empty() {
+        return Err("Enter a request first.".to_string());
+    }
+    if request.len() > 4_000 {
+        return Err("Request is too long (maximum 4,000 characters).".to_string());
+    }
+    if let Some(clarification) = unsupported_app_request(request) {
+        append_debug_log(
+            &app,
+            request,
+            "Locally rejected unsupported app-launch request.",
+        );
+        return Ok(clarification);
+    }
+    let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b-instruct".to_string());
+    let body = json!({"model": model, "stream": false, "format": "json", "options": {"temperature": 0}, "messages": [{"role": "system", "content": system_prompt()}, {"role": "user", "content": request}]});
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| "Could not initialize the local Ollama client.".to_string())?;
+    let response = client.post(OLLAMA_API_URL).json(&body).send().await.map_err(|_| "Could not reach Ollama. Install Ollama, keep it running, and download the selected model first.".to_string())?;
+    let status = response.status();
+    let response_text = response
+        .text()
+        .await
+        .map_err(|_| "Could not read the Claude API response.".to_string())?;
+    if !status.is_success() {
+        append_debug_log(&app, request, &response_text);
+        return Err(format!(
+            "Ollama returned HTTP {}. Run `ollama run qwen3:4b` once, then try again.",
+            status
+        ));
+    }
+    let api_response: OllamaResponse = serde_json::from_str(&response_text)
+        .map_err(|_| "Ollama returned an unreadable API response.".to_string())?;
+    let raw_intent = final_model_output(&api_response.message.content);
+    append_debug_log(&app, request, raw_intent);
+    let intent: Intent = serde_json::from_str(raw_intent)
+        .map_err(|_| "Ollama returned an invalid intent. No action was taken.".to_string())?;
+    if !(0.0..=1.0).contains(&intent.confidence) {
+        return Err(
+            "Ollama returned an invalid confidence score. No action was taken.".to_string(),
+        );
+    }
+    validate_intent(&intent)?;
+    Ok(intent)
+}
+
+const MAX_RESULTS: usize = 50;
+const MAX_WALK_DEPTH: usize = 8;
+
+#[derive(Serialize)]
+struct ToolExecution {
+    tool: String,
+    summary: String,
+    data: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct ProcessResponse {
+    intent: Intent,
+    execution: Option<ToolExecution>,
+    message: String,
+}
+
+fn user_root() -> Result<PathBuf, String> {
+    let variable = if cfg!(target_os = "windows") {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    };
+    let value = env::var(variable).map_err(|_| format!("{} is not configured.", variable))?;
+    fs::canonicalize(value).map_err(|_| "Could not resolve the current user folder.".to_string())
+}
+
+fn scoped_directory(path: Option<&str>) -> Result<PathBuf, String> {
+    let root = user_root()?;
+    let candidate = match path {
+        Some(value) if !value.trim().is_empty() => {
+            let supplied = PathBuf::from(value.trim());
+            if supplied.is_absolute() {
+                supplied
+            } else {
+                root.join(supplied)
+            }
+        }
+        _ => root.join("Documents"),
+    };
+    let resolved = fs::canonicalize(&candidate).map_err(|_| {
+        format!(
+            "Directory does not exist or is not readable: {}",
+            candidate.display()
+        )
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err("File tools are limited to folders inside your user profile.".to_string());
+    }
+    if !resolved.is_dir() {
+        return Err("The selected path is not a directory.".to_string());
+    }
+    Ok(resolved)
+}
+
+fn should_skip_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some(".git" | "node_modules" | "target" | ".cache" | "AppData")
+    )
+}
+
+fn matches_date_range(modified: SystemTime, date_range: Option<&str>) -> bool {
+    let Some(date_range) = date_range else {
+        return true;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+    match date_range.to_lowercase().as_str() {
+        "today" => age <= Duration::from_secs(86_400),
+        "last_week" | "week" => age <= Duration::from_secs(7 * 86_400),
+        "last_month" | "month" => age <= Duration::from_secs(31 * 86_400),
+        _ => true,
+    }
+}
+
+fn collect_files(
+    directory: &Path,
+    depth: usize,
+    predicate: &impl Fn(&Path, &fs::Metadata) -> bool,
+    results: &mut Vec<serde_json::Value>,
+) {
+    if depth > MAX_WALK_DEPTH || results.len() >= MAX_RESULTS {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if results.len() >= MAX_RESULTS {
+            return;
+        }
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            if !should_skip_directory(&path) {
+                collect_files(&path, depth + 1, predicate, results);
+            }
+        } else if metadata.is_file() && predicate(&path, &metadata) {
+            results.push(json!({
+                "path": path.to_string_lossy(),
+                "size_bytes": metadata.len(),
+                "modified": metadata.modified().ok().and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|duration| duration.as_secs())
+            }));
+        }
+    }
+}
+
+fn search_files(params: &IntentParams) -> Result<ToolExecution, String> {
+    let root = scoped_directory(
+        params
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.path.as_deref()),
+    )?;
+    let query = params.query.as_deref().unwrap_or("").to_lowercase();
+    let filters = params.filters.as_ref();
+    let mut matches = Vec::new();
+    collect_files(
+        &root,
+        0,
+        &|path, metadata| {
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let extension_matches = filters
+                .and_then(|filter| filter.file_type.as_ref())
+                .map(|file_type| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            extension.eq_ignore_ascii_case(file_type.trim_start_matches('.'))
+                        })
+                })
+                .unwrap_or(true);
+            let size_matches = filters
+                .and_then(|filter| filter.size_min)
+                .is_none_or(|minimum| metadata.len() >= minimum)
+                && filters
+                    .and_then(|filter| filter.size_max)
+                    .is_none_or(|maximum| metadata.len() <= maximum);
+            let date_matches = metadata.modified().ok().is_some_and(|modified| {
+                matches_date_range(
+                    modified,
+                    filters.and_then(|filter| filter.date_range.as_deref()),
+                )
+            });
+            (query.is_empty() || filename.contains(&query))
+                && extension_matches
+                && size_matches
+                && date_matches
+        },
+        &mut matches,
+    );
+    let count = matches.len();
+    Ok(ToolExecution {
+        tool: "search_files".to_string(),
+        summary: format!("Found {} matching file(s) in {}.", count, root.display()),
+        data: json!({"files": matches, "truncated": count == MAX_RESULTS}),
+    })
+}
+
+fn list_large_files(params: &IntentParams) -> Result<ToolExecution, String> {
+    let root = scoped_directory(params.directory.as_deref())?;
+    let threshold_mb = params
+        .threshold_mb
+        .ok_or_else(|| "A threshold_mb value is required.".to_string())?;
+    let threshold_bytes = threshold_mb.saturating_mul(1_024 * 1_024);
+    let mut matches = Vec::new();
+    collect_files(
+        &root,
+        0,
+        &|_, metadata| metadata.len() >= threshold_bytes,
+        &mut matches,
+    );
+    matches.sort_by_key(|value| {
+        std::cmp::Reverse(
+            value
+                .get("size_bytes")
+                .and_then(|size| size.as_u64())
+                .unwrap_or(0),
+        )
+    });
+    let count = matches.len();
+    Ok(ToolExecution {
+        tool: "list_large_files".to_string(),
+        summary: format!(
+            "Found {} file(s) at least {} MB in {}.",
+            count,
+            threshold_mb,
+            root.display()
+        ),
+        data: json!({"files": matches, "threshold_mb": threshold_mb, "truncated": count == MAX_RESULTS}),
+    })
+}
+
+fn get_system_info() -> ToolExecution {
+    let mut system = System::new_all();
+    system.refresh_all();
+    let disks = Disks::new_with_refreshed_list();
+    let storage: Vec<_> = disks
+        .list()
+        .iter()
+        .map(|disk| {
+            json!({
+                "name": disk.name().to_string_lossy(),
+                "total_bytes": disk.total_space(),
+                "available_bytes": disk.available_space()
+            })
+        })
+        .collect();
+    let mut apps: Vec<_> = system
+        .processes()
+        .values()
+        .map(|process| process.name().to_string_lossy().to_string())
+        .collect();
+    apps.sort();
+    apps.dedup();
+    apps.truncate(50);
+    ToolExecution {
+        tool: "get_system_info".to_string(),
+        summary: "Read system storage, memory, CPU load, and running applications.".to_string(),
+        data: json!({
+            "storage": storage,
+            "ram": {"total_bytes": system.total_memory(), "used_bytes": system.used_memory()},
+            "cpu_load_percent": system.global_cpu_usage(),
+            "running_apps": apps
+        }),
+    }
+}
+
+fn get_network_status() -> Result<ToolExecution, String> {
+    #[cfg(target_os = "windows")]
+    let output = Command::new("netsh")
+        .args(["wlan", "show", "interfaces"])
+        .output();
+    #[cfg(target_os = "linux")]
+    let output = Command::new("nmcli")
+        .args(["-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"])
+        .output();
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let output: Result<std::process::Output, std::io::Error> =
+        Err(std::io::Error::other("Unsupported platform"));
+    let output = output.map_err(|_| "Could not query the network adapter.".to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    #[cfg(target_os = "windows")]
+    let (connected, ssid, signal_strength) = {
+        let connected = text.lines().any(|line| {
+            line.trim_start().starts_with("State") && line.to_lowercase().contains("connected")
+        });
+        let ssid = text.lines().find_map(|line| {
+            let line = line.trim();
+            (line.starts_with("SSID") && !line.starts_with("BSSID"))
+                .then(|| {
+                    line.split_once(':')
+                        .map(|(_, value)| value.trim().to_string())
+                })
+                .flatten()
+        });
+        let signal_strength = text.lines().find_map(|line| {
+            line.trim_start()
+                .starts_with("Signal")
+                .then(|| {
+                    line.split_once(':').and_then(|(_, value)| {
+                        value.trim().trim_end_matches('%').parse::<u8>().ok()
+                    })
+                })
+                .flatten()
+        });
+        (connected, ssid, signal_strength)
+    };
+    #[cfg(target_os = "linux")]
+    let (connected, ssid, signal_strength) = text
+        .lines()
+        .find_map(|line| {
+            let mut values = line.splitn(3, ':');
+            (values.next() == Some("yes")).then(|| {
+                (
+                    true,
+                    values
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                    values.next().and_then(|value| value.parse::<u8>().ok()),
+                )
+            })
+        })
+        .unwrap_or((false, None, None));
+    Ok(ToolExecution {
+        tool: "get_network_status".to_string(),
+        summary: if connected {
+            "Network connection found.".to_string()
+        } else {
+            "No active Wi-Fi connection found.".to_string()
+        },
+        data: json!({"connected": connected, "ssid": ssid, "signal_strength": signal_strength}),
+    })
+}
+
+fn read_recent_logs(params: &IntentParams) -> Result<ToolExecution, String> {
+    let service = params
+        .service_name
+        .as_deref()
+        .ok_or_else(|| "A service_name is required.".to_string())?;
+    if service.len() > 100
+        || !service.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ' ')
+        })
+    {
+        return Err("Service name contains unsupported characters.".to_string());
+    }
+    let lines = params.lines.unwrap_or(50).clamp(1, 200);
+    #[cfg(target_os = "linux")]
+    let output = Command::new("journalctl")
+        .args([
+            "-u",
+            service,
+            "-n",
+            &lines.to_string(),
+            "--no-pager",
+            "--output=short-iso",
+        ])
+        .output();
+    #[cfg(target_os = "windows")]
+    let output = {
+        let log_name = match service.to_lowercase().as_str() { "application" => "Application", "system" => "System", "security" => "Security", _ => return Err("Windows development mode supports Application, System, or Security log names only.".to_string()) };
+        Command::new("wevtutil")
+            .args([
+                "qe",
+                log_name,
+                "/rd:true",
+                "/f:text",
+                &format!("/c:{}", lines),
+            ])
+            .output()
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let output: Result<std::process::Output, std::io::Error> =
+        Err(std::io::Error::other("Unsupported platform"));
+    let output = output.map_err(|_| "Could not read recent logs.".to_string())?;
+    let logs = String::from_utf8_lossy(&output.stdout)
+        .chars()
+        .take(30_000)
+        .collect::<String>();
+    Ok(ToolExecution {
+        tool: "read_recent_logs".to_string(),
+        summary: format!("Read up to {} recent log entries from {}.", lines, service),
+        data: json!({"service_name": service, "lines": lines, "logs": logs}),
+    })
+}
+
+fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
+    match intent.action {
+        Action::SearchFiles => search_files(&intent.params),
+        Action::GetSystemInfo => Ok(get_system_info()),
+        Action::ListLargeFiles => list_large_files(&intent.params),
+        Action::GetNetworkStatus => get_network_status(),
+        Action::ReadRecentLogs => read_recent_logs(&intent.params),
+        Action::ToggleSetting => Err(
+            "Settings changes require the Step 4 confirmation gate and cannot run yet.".to_string(),
+        ),
+    }
+}
+
+#[tauri::command]
+async fn process_request(app: AppHandle, request: String) -> Result<ProcessResponse, String> {
+    let intent = parse_intent(app, request).await?;
+    if intent.clarification_needed {
+        let message = intent
+            .clarification_question
+            .clone()
+            .unwrap_or_else(|| "Please clarify your request.".to_string());
+        return Ok(ProcessResponse {
+            intent,
+            execution: None,
+            message,
+        });
+    }
+    match intent.risk_tier {
+        RiskTier::Low => {
+            let execution = execute_low_risk(&intent)?;
+            let message = format!("{} No system changes were made.", execution.summary);
+            Ok(ProcessResponse { intent, execution: Some(execution), message })
+        }
+        RiskTier::Medium => Ok(ProcessResponse { intent, execution: None, message: "This setting change needs a confirmation gate, which is the next build step. Nothing was changed.".to_string() }),
+        RiskTier::High => Ok(ProcessResponse { intent, execution: None, message: "High-risk actions are out of scope for this MVP. Nothing was changed.".to_string() }),
+    }
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![parse_intent, process_request])
+        .run(tauri::generate_context!())
+        .expect("error while running AI Native Control Layer");
+}

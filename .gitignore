@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.pnpm-store/
+src-tauri/target/
+src-tauri/gen/
+
+# Local configuration and diagnostics
+.env
+.env.*
+!.env.example
+*.log
