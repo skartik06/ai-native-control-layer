@@ -14,12 +14,25 @@ type ProcessResult = {
   intent: IntentResult;
   execution: unknown | null;
   message: string;
+  confirmation: ConfirmationPreview | null;
+};
+
+type ConfirmationPreview = {
+  summary: string;
+  expires_in_seconds: number;
+};
+
+type ToolExecution = {
+  tool: string;
+  summary: string;
+  data: unknown;
 };
 
 function App() {
   const [input, setInput] = useState("");
   const [response, setResponse] = useState("");
   const [loading, setLoading] = useState(false);
+  const [confirmation, setConfirmation] = useState<ConfirmationPreview | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -50,7 +63,7 @@ function App() {
   async function submit(event: FormEvent) {
     event.preventDefault();
     const request = input.trim();
-    if (!request) return;
+    if (!request || confirmation) return;
     if (!isTauri) {
       setResponse("Intent parsing requires the native app plus a local Ollama model. Start it with `pnpm tauri dev` after running `ollama run qwen3:4b`.");
       return;
@@ -59,24 +72,63 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const result = await invoke<ProcessResult>("process_request", { request });
-      setResponse(result.intent.clarification_needed
-        ? `Clarification needed: ${result.message}`
-        : `${result.message}\n\n${JSON.stringify(result.execution, null, 2)}`);
+      if (result.confirmation) {
+        setConfirmation(result.confirmation);
+        setResponse(result.message);
+      } else {
+        setResponse(result.intent.clarification_needed
+          ? `Clarification needed: ${result.message}`
+          : `${result.message}\n\n${JSON.stringify(result.execution, null, 2)}`);
+      }
       setInput("");
     } catch (error) {
       setResponse(`Could not parse intent: ${String(error)}`);
     } finally { setLoading(false); }
   }
 
+  async function confirm() {
+    if (!isTauri || !confirmation) return;
+    setLoading(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<ToolExecution>("confirm_pending_action");
+      setResponse(`${result.summary}\n\n${JSON.stringify(result.data, null, 2)}`);
+      setConfirmation(null);
+    } catch (error) {
+      setResponse(`Setting was not changed: ${String(error)}`);
+      setConfirmation(null);
+    } finally { setLoading(false); }
+  }
+
+  async function cancel() {
+    if (!isTauri || !confirmation) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setResponse(await invoke<string>("cancel_pending_action"));
+    } catch (error) {
+      setResponse(`Could not cancel pending action: ${String(error)}`);
+    } finally {
+      setConfirmation(null);
+    }
+  }
+
   return <main className="overlay-shell">
     <section className="command-palette" aria-label="AI Native Control Layer">
       <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>CONTROL LAYER</span><kbd>Ctrl Space</kbd></div>
       <form onSubmit={submit}>
-        <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading}
+        <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
           placeholder="Ask your computer anything..." aria-label="Command input" />
       </form>
+      {confirmation && <section className="confirmation" aria-label="Confirm setting change">
+        <p>Preview: {confirmation.summary}</p>
+        <small>This expires in {confirmation.expires_in_seconds} seconds.</small>
+        <div className="confirmation-actions">
+          <button type="button" onClick={cancel} disabled={loading}>Cancel</button>
+          <button type="button" className="confirm" onClick={confirm} disabled={loading}>Confirm change</button>
+        </div>
+      </section>}
       {response && <pre className="response" role="status">{response}</pre>}
-      <p className="hint">{loading ? "Interpreting request..." : "Linux MVP · read-only tools run automatically; changes require confirmation."}</p>
+      <p className="hint">{loading ? "Working..." : confirmation ? "Nothing changes until you confirm." : "Linux MVP · read-only tools run automatically; changes require confirmation."}</p>
     </section>
   </main>;
 }

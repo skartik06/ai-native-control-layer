@@ -6,6 +6,8 @@ Linux-first Tauri desktop overlay with a `Ctrl+Space` global toggle, local Ollam
 
 Install a current Rust toolchain, Node.js 20+, Ollama, and your distro's Tauri/WebKit and NetworkManager dependencies. On Debian/Ubuntu, see the [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
 
+For the optional settings adapters, install `brightnessctl` for brightness control. Dark mode and Do Not Disturb currently use GNOME's `gsettings` schemas; unsupported desktops return an error instead of guessing.
+
 ## Run
 
 ```bash
@@ -44,6 +46,17 @@ Read-only tools that can run automatically on Linux are:
 - recent systemd service logs through `journalctl`
 
 Settings changes, app launching, file deletion, package installation, and all other high-risk operations are not implemented. No low-risk tool accepts or executes a shell string from the model.
+
+## Setting confirmation gate
+
+The only medium-risk operation is a whitelisted `toggle_setting`. The backend validates both the setting and value before it shows a preview. A confirmation is kept only in backend memory, expires after 60 seconds, and is discarded on cancel or after one attempt. The frontend cannot modify the setting value after preview.
+
+Current Linux adapters:
+
+- Wi-Fi on/off through NetworkManager `nmcli`
+- brightness from 0–100% through `brightnessctl`
+- GNOME dark mode through `gsettings`
+- GNOME Do Not Disturb through `gsettings`
 
 ## Verification
 

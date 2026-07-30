@@ -10,10 +10,11 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, SystemTime},
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime},
 };
 use sysinfo::{Disks, System};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
 
@@ -265,7 +266,75 @@ fn plan_intent(intent: &Intent) -> Result<RiskTier, String> {
     if intent.risk_tier != expected_risk {
         return Err("Ollama assigned an incompatible risk tier. No action was taken.".to_string());
     }
+    if matches!(intent.action, Action::ToggleSetting) {
+        prepare_toggle(&intent.params)?;
+    }
     Ok(expected_risk)
+}
+
+fn bool_value(value: &serde_json::Value, setting_name: &str) -> Result<bool, String> {
+    value.as_bool().ok_or_else(|| {
+        format!(
+            "{} must be set to true or false. No action was taken.",
+            setting_name
+        )
+    })
+}
+
+fn prepare_toggle(params: &IntentParams) -> Result<ToggleSetting, String> {
+    let setting_name = params
+        .setting_name
+        .as_deref()
+        .ok_or_else(|| "A setting name is required. No action was taken.".to_string())?
+        .trim()
+        .to_lowercase();
+    let value = params
+        .value
+        .as_ref()
+        .ok_or_else(|| "A setting value is required. No action was taken.".to_string())?;
+    match setting_name.as_str() {
+        "wifi" => Ok(ToggleSetting::Wifi {
+            enabled: bool_value(value, "Wi-Fi")?,
+        }),
+        "brightness" => {
+            let percent = value.as_u64().ok_or_else(|| {
+                "Brightness must be a whole number from 0 to 100. No action was taken.".to_string()
+            })?;
+            let percent = u8::try_from(percent)
+                .ok()
+                .filter(|value| *value <= 100)
+                .ok_or_else(|| {
+                    "Brightness must be a whole number from 0 to 100. No action was taken."
+                        .to_string()
+                })?;
+            Ok(ToggleSetting::Brightness { percent })
+        }
+        "dark_mode" | "dark mode" => Ok(ToggleSetting::DarkMode {
+            enabled: bool_value(value, "Dark mode")?,
+        }),
+        "do_not_disturb" | "do not disturb" => Ok(ToggleSetting::DoNotDisturb {
+            enabled: bool_value(value, "Do not disturb")?,
+        }),
+        _ => {
+            Err("That setting is not in the Linux MVP whitelist. No action was taken.".to_string())
+        }
+    }
+}
+
+fn toggle_preview(setting: &ToggleSetting) -> String {
+    match setting {
+        ToggleSetting::Wifi { enabled } => {
+            format!("Turn Wi-Fi {}.", if *enabled { "on" } else { "off" })
+        }
+        ToggleSetting::Brightness { percent } => format!("Set screen brightness to {}%.", percent),
+        ToggleSetting::DarkMode { enabled } => {
+            format!("Turn dark mode {}.", if *enabled { "on" } else { "off" })
+        }
+        ToggleSetting::DoNotDisturb { enabled } => format!(
+            "Turn Do Not Disturb {}.",
+            if *enabled { "on" } else { "off" }
+        ),
+    }
 }
 
 #[tauri::command]
@@ -334,7 +403,37 @@ struct ProcessResponse {
     intent: Intent,
     execution: Option<ToolExecution>,
     message: String,
+    confirmation: Option<ConfirmationPreview>,
 }
+
+#[derive(Serialize)]
+struct ConfirmationPreview {
+    summary: String,
+    expires_in_seconds: u64,
+}
+
+#[derive(Clone)]
+enum ToggleSetting {
+    Wifi { enabled: bool },
+    Brightness { percent: u8 },
+    DarkMode { enabled: bool },
+    DoNotDisturb { enabled: bool },
+}
+
+struct PendingAction {
+    setting: ToggleSetting,
+    created_at: Instant,
+}
+
+struct PendingConfirmation(Mutex<Option<PendingAction>>);
+
+impl Default for PendingConfirmation {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "linux")]
 fn user_root() -> Result<PathBuf, String> {
@@ -675,6 +774,69 @@ fn read_recent_logs(_: &IntentParams) -> Result<ToolExecution, String> {
     Err("Log inspection is available in the Linux desktop MVP only.".to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn run_setting_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = Command::new(program).args(args).output().map_err(|_| {
+        format!(
+            "Could not run {}. Check that it is installed and available.",
+            program
+        )
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{} did not apply the requested setting.", program))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_toggle(setting: &ToggleSetting) -> Result<ToolExecution, String> {
+    match setting {
+        ToggleSetting::Wifi { enabled } => {
+            run_setting_command(
+                "nmcli",
+                &["radio", "wifi", if *enabled { "on" } else { "off" }],
+            )?;
+        }
+        ToggleSetting::Brightness { percent } => {
+            let value = format!("{}%", percent);
+            run_setting_command("brightnessctl", &["set", &value])?;
+        }
+        ToggleSetting::DarkMode { enabled } => {
+            run_setting_command(
+                "gsettings",
+                &[
+                    "set",
+                    "org.gnome.desktop.interface",
+                    "color-scheme",
+                    if *enabled { "prefer-dark" } else { "default" },
+                ],
+            )?;
+        }
+        ToggleSetting::DoNotDisturb { enabled } => {
+            run_setting_command(
+                "gsettings",
+                &[
+                    "set",
+                    "org.gnome.desktop.notifications",
+                    "show-banners",
+                    if *enabled { "false" } else { "true" },
+                ],
+            )?;
+        }
+    }
+    Ok(ToolExecution {
+        tool: "toggle_setting".to_string(),
+        summary: format!("Applied: {}", toggle_preview(setting)),
+        data: json!({"applied": true}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_toggle(_: &ToggleSetting) -> Result<ToolExecution, String> {
+    Err("Settings changes are available in the Linux desktop MVP only.".to_string())
+}
+
 fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
     match intent.action {
         Action::SearchFiles => search_files(&intent.params),
@@ -682,14 +844,18 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
         Action::ListLargeFiles => list_large_files(&intent.params),
         Action::GetNetworkStatus => get_network_status(),
         Action::ReadRecentLogs => read_recent_logs(&intent.params),
-        Action::ToggleSetting => Err(
-            "Settings changes require the Step 4 confirmation gate and cannot run yet.".to_string(),
-        ),
+        Action::ToggleSetting => {
+            Err("Settings changes must pass through the confirmation gate.".to_string())
+        }
     }
 }
 
 #[tauri::command]
-async fn process_request(app: AppHandle, request: String) -> Result<ProcessResponse, String> {
+async fn process_request(
+    app: AppHandle,
+    pending_confirmation: State<'_, PendingConfirmation>,
+    request: String,
+) -> Result<ProcessResponse, String> {
     let intent = parse_intent(app, request).await?;
     if intent.clarification_needed {
         let message = intent
@@ -700,23 +866,96 @@ async fn process_request(app: AppHandle, request: String) -> Result<ProcessRespo
             intent,
             execution: None,
             message,
+            confirmation: None,
         });
     }
     match plan_intent(&intent)? {
         RiskTier::Low => {
             let execution = execute_low_risk(&intent)?;
             let message = format!("{} No system changes were made.", execution.summary);
-            Ok(ProcessResponse { intent, execution: Some(execution), message })
+            Ok(ProcessResponse {
+                intent,
+                execution: Some(execution),
+                message,
+                confirmation: None,
+            })
         }
-        RiskTier::Medium => Ok(ProcessResponse { intent, execution: None, message: "This setting change needs a confirmation gate, which is the next build step. Nothing was changed.".to_string() }),
-        RiskTier::High => Ok(ProcessResponse { intent, execution: None, message: "High-risk actions are out of scope for this MVP. Nothing was changed.".to_string() }),
+        RiskTier::Medium => {
+            let setting = prepare_toggle(&intent.params)?;
+            let preview = toggle_preview(&setting);
+            let mut pending = pending_confirmation.0.lock().map_err(|_| {
+                "The confirmation gate is unavailable. No action was taken.".to_string()
+            })?;
+            *pending = Some(PendingAction {
+                setting,
+                created_at: Instant::now(),
+            });
+            Ok(ProcessResponse {
+                intent,
+                execution: None,
+                message: "Confirmation required. Nothing has changed yet.".to_string(),
+                confirmation: Some(ConfirmationPreview {
+                    summary: preview,
+                    expires_in_seconds: CONFIRMATION_TTL.as_secs(),
+                }),
+            })
+        }
+        RiskTier::High => Ok(ProcessResponse {
+            intent,
+            execution: None,
+            message: "High-risk actions are out of scope for this MVP. Nothing was changed."
+                .to_string(),
+            confirmation: None,
+        }),
+    }
+}
+
+#[tauri::command]
+fn confirm_pending_action(
+    pending_confirmation: State<'_, PendingConfirmation>,
+) -> Result<ToolExecution, String> {
+    let pending = {
+        let mut current = pending_confirmation.0.lock().map_err(|_| {
+            "The confirmation gate is unavailable. No action was taken.".to_string()
+        })?;
+        let pending = current
+            .take()
+            .ok_or_else(|| "There is no pending action to confirm.".to_string())?;
+        if pending.created_at.elapsed() > CONFIRMATION_TTL {
+            return Err(
+                "The confirmation expired after 60 seconds. Submit the request again.".to_string(),
+            );
+        }
+        pending
+    };
+    execute_toggle(&pending.setting)
+}
+
+#[tauri::command]
+fn cancel_pending_action(
+    pending_confirmation: State<'_, PendingConfirmation>,
+) -> Result<String, String> {
+    let mut current = pending_confirmation
+        .0
+        .lock()
+        .map_err(|_| "The confirmation gate is unavailable.".to_string())?;
+    if current.take().is_some() {
+        Ok("Pending setting change cancelled. Nothing was changed.".to_string())
+    } else {
+        Ok("There was no pending setting change.".to_string())
     }
 }
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![parse_intent, process_request])
+        .manage(PendingConfirmation::default())
+        .invoke_handler(tauri::generate_handler![
+            parse_intent,
+            process_request,
+            confirm_pending_action,
+            cancel_pending_action
+        ])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");
 }
@@ -771,6 +1010,41 @@ mod tests {
             RiskTier::Low,
         ));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn planner_allows_only_whitelisted_medium_risk_settings() {
+        let result = plan_intent(&intent(
+            Action::ToggleSetting,
+            IntentParams {
+                setting_name: Some("dark_mode".to_string()),
+                value: Some(json!(true)),
+                ..Default::default()
+            },
+            RiskTier::Medium,
+        ));
+        assert!(matches!(result, Ok(RiskTier::Medium)));
+    }
+
+    #[test]
+    fn brightness_requires_a_bounded_integer() {
+        let result = prepare_toggle(&IntentParams {
+            setting_name: Some("brightness".to_string()),
+            value: Some(json!(101)),
+            ..Default::default()
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn preview_shows_the_exact_setting_change() {
+        let setting = prepare_toggle(&IntentParams {
+            setting_name: Some("wifi".to_string()),
+            value: Some(json!(false)),
+            ..Default::default()
+        })
+        .expect("Wi-Fi should be a supported setting");
+        assert_eq!(toggle_preview(&setting), "Turn Wi-Fi off.");
     }
 
     #[test]

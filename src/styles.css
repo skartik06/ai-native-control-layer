@@ -10,4 +10,11 @@ form { border-top: 1px solid #27344e; border-bottom: 1px solid #27344e; }
 input { width: 100%; border: 0; outline: 0; padding: 21px 18px; background: transparent; color: #fff; font: 500 18px/1.4 inherit; }
 input::placeholder { color: #70809d; }
 .response { max-height: 220px; margin: 0; overflow: auto; padding: 16px 18px; color: #c9d8f6; white-space: pre-wrap; background: rgba(91, 129, 195, .12); font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.confirmation { padding: 14px 18px; border-bottom: 1px solid #27344e; background: rgba(230, 178, 67, .12); color: #f7e5ad; }
+.confirmation p { margin: 0 0 4px; font-weight: 650; }
+.confirmation small { color: #bda873; }
+.confirmation-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.confirmation button { border: 1px solid #536582; border-radius: 6px; padding: 7px 10px; background: transparent; color: #dce7fb; font: 600 12px/1 inherit; cursor: pointer; }
+.confirmation button.confirm { border-color: #d5a842; background: #d5a842; color: #101827; }
+.confirmation button:disabled { cursor: wait; opacity: .6; }
 .hint { margin: 0; padding: 12px 18px; color: #72819b; font-size: 12px; }
