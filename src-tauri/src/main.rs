@@ -557,6 +557,48 @@ fn get_system_info() -> ToolExecution {
 }
 
 #[cfg(target_os = "linux")]
+fn split_nmcli_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            field.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == ':' {
+            fields.push(field);
+            field = String::new();
+        } else {
+            field.push(character);
+        }
+    }
+    if escaped {
+        field.push('\\');
+    }
+    fields.push(field);
+    fields
+}
+
+#[cfg(target_os = "linux")]
+fn parse_network_status(output: &str) -> (bool, Option<String>, Option<u8>) {
+    output
+        .lines()
+        .find_map(|line| {
+            let fields = split_nmcli_fields(line);
+            (fields.first().map(String::as_str) == Some("yes")).then(|| {
+                (
+                    true,
+                    fields.get(1).filter(|value| !value.is_empty()).cloned(),
+                    fields.get(2).and_then(|value| value.parse::<u8>().ok()),
+                )
+            })
+        })
+        .unwrap_or((false, None, None))
+}
+
+#[cfg(target_os = "linux")]
 fn get_network_status() -> Result<ToolExecution, String> {
     let output = Command::new("nmcli")
         .args(["-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"])
@@ -566,22 +608,7 @@ fn get_network_status() -> Result<ToolExecution, String> {
         return Err("NetworkManager could not report Wi-Fi status.".to_string());
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let (connected, ssid, signal_strength) = text
-        .lines()
-        .find_map(|line| {
-            let mut values = line.splitn(3, ':');
-            (values.next() == Some("yes")).then(|| {
-                (
-                    true,
-                    values
-                        .next()
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string),
-                    values.next().and_then(|value| value.parse::<u8>().ok()),
-                )
-            })
-        })
-        .unwrap_or((false, None, None));
+    let (connected, ssid, signal_strength) = parse_network_status(&text);
     Ok(ToolExecution {
         tool: "get_network_status".to_string(),
         summary: if connected {
@@ -598,17 +625,20 @@ fn get_network_status() -> Result<ToolExecution, String> {
     Err("Network diagnostics are available in the Linux desktop MVP only.".to_string())
 }
 
+fn is_valid_service_name(service: &str) -> bool {
+    service.len() <= 100
+        && service.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ' ')
+        })
+}
+
 #[cfg(target_os = "linux")]
 fn read_recent_logs(params: &IntentParams) -> Result<ToolExecution, String> {
     let service = params
         .service_name
         .as_deref()
         .ok_or_else(|| "A service_name is required.".to_string())?;
-    if service.len() > 100
-        || !service.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ' ')
-        })
-    {
+    if !is_valid_service_name(service) {
         return Err("Service name contains unsupported characters.".to_string());
     }
     let lines = params.lines.unwrap_or(50).clamp(1, 200);
@@ -689,4 +719,104 @@ fn main() {
         .invoke_handler(tauri::generate_handler![parse_intent, process_request])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn intent(action: Action, params: IntentParams, risk_tier: RiskTier) -> Intent {
+        Intent {
+            action,
+            params,
+            risk_tier,
+            confidence: 0.95,
+            clarification_needed: false,
+            clarification_question: None,
+        }
+    }
+
+    #[test]
+    fn planner_accepts_a_scoped_file_search() {
+        let result = plan_intent(&intent(
+            Action::SearchFiles,
+            IntentParams {
+                query: Some("invoice".to_string()),
+                ..Default::default()
+            },
+            RiskTier::Low,
+        ));
+        assert!(matches!(result, Ok(RiskTier::Low)));
+    }
+
+    #[test]
+    fn planner_rejects_missing_search_criteria() {
+        let result = plan_intent(&intent(
+            Action::SearchFiles,
+            IntentParams::default(),
+            RiskTier::Low,
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn planner_does_not_trust_a_model_selected_risk_level() {
+        let result = plan_intent(&intent(
+            Action::ToggleSetting,
+            IntentParams {
+                setting_name: Some("wifi".to_string()),
+                value: Some(json!(false)),
+                ..Default::default()
+            },
+            RiskTier::Low,
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn app_launch_requests_are_rejected_before_the_model() {
+        let result = unsupported_app_request("open the file manager");
+        assert!(result.is_some_and(|intent| intent.clarification_needed));
+    }
+
+    #[test]
+    fn collect_files_applies_the_predicate() {
+        let directory = env::temp_dir().join(format!(
+            "ai-native-control-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        fs::write(directory.join("keep.txt"), "safe").expect("test file should be written");
+        fs::write(directory.join("skip.bin"), "safe").expect("test file should be written");
+
+        let mut results = Vec::new();
+        collect_files(
+            &directory,
+            0,
+            &|path, _| path.extension().is_some_and(|extension| extension == "txt"),
+            &mut results,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("keep.txt")));
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn log_service_names_are_restricted_to_safe_characters() {
+        assert!(is_valid_service_name("NetworkManager.service"));
+        assert!(!is_valid_service_name("NetworkManager.service; reboot"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_parser_handles_colons_in_an_ssid() {
+        let status = parse_network_status("yes:home\\:lab:78");
+        assert_eq!(status, (true, Some("home:lab".to_string()), Some(78)));
+    }
 }

@@ -31,4 +31,4 @@ jobs:
         run: pnpm build
       - name: Compile Rust backend
         working-directory: src-tauri
-        run: cargo check
+        run: cargo test
