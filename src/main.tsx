@@ -76,7 +76,7 @@ function App() {
           placeholder="Ask your computer anything..." aria-label="Command input" />
       </form>
       {response && <pre className="response" role="status">{response}</pre>}
-      <p className="hint">{loading ? "Interpreting request..." : "Step 2 only parses intent. It never executes system actions."}</p>
+      <p className="hint">{loading ? "Interpreting request..." : "Linux MVP · read-only tools run automatically; changes require confirmation."}</p>
     </section>
   </main>;
 }

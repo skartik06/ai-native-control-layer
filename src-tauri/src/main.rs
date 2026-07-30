@@ -17,7 +17,7 @@ use tauri::{AppHandle, Manager};
 
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
     SearchFiles,
@@ -28,7 +28,7 @@ enum Action {
     ReadRecentLogs,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RiskTier {
     Low,
@@ -146,14 +146,9 @@ fn unsupported_app_request(request: &str) -> Option<Intent> {
     let asks_to_launch = ["open", "launch", "start", "run"]
         .iter()
         .any(|verb| request.contains(verb));
-    let unsupported_app = [
-        "file explorer",
-        "explorer.exe",
-        "terminal",
-        "command prompt",
-    ]
-    .iter()
-    .any(|app| request.contains(app));
+    let unsupported_app = ["file manager", "nautilus", "dolphin", "terminal", "browser"]
+        .iter()
+        .any(|app| request.contains(app));
     if asks_to_launch && unsupported_app {
         Some(Intent {
             action: Action::SearchFiles,
@@ -189,7 +184,18 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
     }
 
     let params = &intent.params;
-    match &intent.action {
+    match intent.action {
+        Action::SearchFiles
+            if (params.query.is_none() && params.filters.is_none())
+                || params.directory.is_some()
+                || params.threshold_mb.is_some()
+                || params.setting_name.is_some()
+                || params.value.is_some()
+                || params.service_name.is_some()
+                || params.lines.is_some() =>
+        {
+            Err("Ollama returned invalid search-file parameters. No action was taken.".to_string())
+        }
         Action::GetSystemInfo | Action::GetNetworkStatus
             if params.query.is_some()
                 || params.filters.is_some()
@@ -202,17 +208,64 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
         {
             Err("Ollama returned incompatible parameters for a read-only action. No action was taken.".to_string())
         }
-        Action::ListLargeFiles if params.directory.is_none() || params.threshold_mb.is_none() => {
+        Action::ListLargeFiles
+            if params.directory.is_none()
+                || params.threshold_mb.is_none()
+                || params.query.is_some()
+                || params.filters.is_some()
+                || params.setting_name.is_some()
+                || params.value.is_some()
+                || params.service_name.is_some()
+                || params.lines.is_some() =>
+        {
             Err("Ollama omitted required large-file parameters. No action was taken.".to_string())
         }
-        Action::ToggleSetting if params.setting_name.is_none() || params.value.is_none() => {
+        Action::ToggleSetting
+            if params.setting_name.is_none()
+                || params.value.is_none()
+                || params.query.is_some()
+                || params.filters.is_some()
+                || params.directory.is_some()
+                || params.threshold_mb.is_some()
+                || params.service_name.is_some()
+                || params.lines.is_some() =>
+        {
             Err("Ollama omitted required setting parameters. No action was taken.".to_string())
         }
-        Action::ReadRecentLogs if params.service_name.is_none() || params.lines.is_none() => {
+        Action::ReadRecentLogs
+            if params.service_name.is_none()
+                || params.lines.is_none()
+                || params.query.is_some()
+                || params.filters.is_some()
+                || params.directory.is_some()
+                || params.threshold_mb.is_some()
+                || params.setting_name.is_some()
+                || params.value.is_some() =>
+        {
             Err("Ollama omitted required log parameters. No action was taken.".to_string())
         }
         _ => Ok(()),
     }
+}
+
+fn planned_risk(action: Action) -> RiskTier {
+    match action {
+        Action::ToggleSetting => RiskTier::Medium,
+        Action::SearchFiles
+        | Action::GetSystemInfo
+        | Action::ListLargeFiles
+        | Action::GetNetworkStatus
+        | Action::ReadRecentLogs => RiskTier::Low,
+    }
+}
+
+fn plan_intent(intent: &Intent) -> Result<RiskTier, String> {
+    validate_intent(intent)?;
+    let expected_risk = planned_risk(intent.action);
+    if intent.risk_tier != expected_risk {
+        return Err("Ollama assigned an incompatible risk tier. No action was taken.".to_string());
+    }
+    Ok(expected_risk)
 }
 
 #[tauri::command]
@@ -283,14 +336,15 @@ struct ProcessResponse {
     message: String,
 }
 
+#[cfg(target_os = "linux")]
 fn user_root() -> Result<PathBuf, String> {
-    let variable = if cfg!(target_os = "windows") {
-        "USERPROFILE"
-    } else {
-        "HOME"
-    };
-    let value = env::var(variable).map_err(|_| format!("{} is not configured.", variable))?;
+    let value = env::var("HOME").map_err(|_| "HOME is not configured.".to_string())?;
     fs::canonicalize(value).map_err(|_| "Could not resolve the current user folder.".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn user_root() -> Result<PathBuf, String> {
+    Err("This MVP supports Linux desktop only.".to_string())
 }
 
 fn scoped_directory(path: Option<&str>) -> Result<PathBuf, String> {
@@ -502,47 +556,16 @@ fn get_system_info() -> ToolExecution {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn get_network_status() -> Result<ToolExecution, String> {
-    #[cfg(target_os = "windows")]
-    let output = Command::new("netsh")
-        .args(["wlan", "show", "interfaces"])
-        .output();
-    #[cfg(target_os = "linux")]
     let output = Command::new("nmcli")
         .args(["-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"])
-        .output();
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let output: Result<std::process::Output, std::io::Error> =
-        Err(std::io::Error::other("Unsupported platform"));
-    let output = output.map_err(|_| "Could not query the network adapter.".to_string())?;
+        .output()
+        .map_err(|_| "Could not query NetworkManager. Is nmcli installed?".to_string())?;
+    if !output.status.success() {
+        return Err("NetworkManager could not report Wi-Fi status.".to_string());
+    }
     let text = String::from_utf8_lossy(&output.stdout);
-    #[cfg(target_os = "windows")]
-    let (connected, ssid, signal_strength) = {
-        let connected = text.lines().any(|line| {
-            line.trim_start().starts_with("State") && line.to_lowercase().contains("connected")
-        });
-        let ssid = text.lines().find_map(|line| {
-            let line = line.trim();
-            (line.starts_with("SSID") && !line.starts_with("BSSID"))
-                .then(|| {
-                    line.split_once(':')
-                        .map(|(_, value)| value.trim().to_string())
-                })
-                .flatten()
-        });
-        let signal_strength = text.lines().find_map(|line| {
-            line.trim_start()
-                .starts_with("Signal")
-                .then(|| {
-                    line.split_once(':').and_then(|(_, value)| {
-                        value.trim().trim_end_matches('%').parse::<u8>().ok()
-                    })
-                })
-                .flatten()
-        });
-        (connected, ssid, signal_strength)
-    };
-    #[cfg(target_os = "linux")]
     let (connected, ssid, signal_strength) = text
         .lines()
         .find_map(|line| {
@@ -570,6 +593,12 @@ fn get_network_status() -> Result<ToolExecution, String> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn get_network_status() -> Result<ToolExecution, String> {
+    Err("Network diagnostics are available in the Linux desktop MVP only.".to_string())
+}
+
+#[cfg(target_os = "linux")]
 fn read_recent_logs(params: &IntentParams) -> Result<ToolExecution, String> {
     let service = params
         .service_name
@@ -583,7 +612,6 @@ fn read_recent_logs(params: &IntentParams) -> Result<ToolExecution, String> {
         return Err("Service name contains unsupported characters.".to_string());
     }
     let lines = params.lines.unwrap_or(50).clamp(1, 200);
-    #[cfg(target_os = "linux")]
     let output = Command::new("journalctl")
         .args([
             "-u",
@@ -593,24 +621,14 @@ fn read_recent_logs(params: &IntentParams) -> Result<ToolExecution, String> {
             "--no-pager",
             "--output=short-iso",
         ])
-        .output();
-    #[cfg(target_os = "windows")]
-    let output = {
-        let log_name = match service.to_lowercase().as_str() { "application" => "Application", "system" => "System", "security" => "Security", _ => return Err("Windows development mode supports Application, System, or Security log names only.".to_string()) };
-        Command::new("wevtutil")
-            .args([
-                "qe",
-                log_name,
-                "/rd:true",
-                "/f:text",
-                &format!("/c:{}", lines),
-            ])
-            .output()
-    };
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let output: Result<std::process::Output, std::io::Error> =
-        Err(std::io::Error::other("Unsupported platform"));
-    let output = output.map_err(|_| "Could not read recent logs.".to_string())?;
+        .output()
+        .map_err(|_| "Could not run journalctl. Is systemd available?".to_string())?;
+    if !output.status.success() {
+        return Err(
+            "journalctl could not read that service. Check the service name and permissions."
+                .to_string(),
+        );
+    }
     let logs = String::from_utf8_lossy(&output.stdout)
         .chars()
         .take(30_000)
@@ -620,6 +638,11 @@ fn read_recent_logs(params: &IntentParams) -> Result<ToolExecution, String> {
         summary: format!("Read up to {} recent log entries from {}.", lines, service),
         data: json!({"service_name": service, "lines": lines, "logs": logs}),
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_recent_logs(_: &IntentParams) -> Result<ToolExecution, String> {
+    Err("Log inspection is available in the Linux desktop MVP only.".to_string())
 }
 
 fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
@@ -649,7 +672,7 @@ async fn process_request(app: AppHandle, request: String) -> Result<ProcessRespo
             message,
         });
     }
-    match intent.risk_tier {
+    match plan_intent(&intent)? {
         RiskTier::Low => {
             let execution = execute_low_risk(&intent)?;
             let message = format!("{} No system changes were made.", execution.summary);
