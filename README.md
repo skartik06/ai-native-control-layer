@@ -33,6 +33,12 @@ pnpm tauri dev
 
 `qwen3:4b` is a ~2.5 GB download. Optionally set `OLLAMA_MODEL` to another locally downloaded model. The backend writes raw input and model output to its local app-data debug log as required for development; the log is not uploaded anywhere by the app.
 
+The local response timeout is 180 seconds by default because CPU-only virtual machines can be slow. To allow up to ten minutes for a request:
+
+```bash
+OLLAMA_TIMEOUT_SECONDS=600 OLLAMA_MODEL=qwen3:4b pnpm tauri dev
+```
+
 ## Current MVP scope
 
 The action planner independently validates every model response. It rejects unrecognised parameters, confidence below 0.9, and a model-selected risk tier that does not match the tool.

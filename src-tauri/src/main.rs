@@ -17,6 +17,7 @@ use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager, State};
 
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
+const DEFAULT_OLLAMA_TIMEOUT_SECONDS: u64 = 180;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +141,15 @@ fn final_model_output(content: &str) -> &str {
         .rsplit_once("</think>")
         .map(|(_, answer)| answer.trim())
         .unwrap_or_else(|| content.trim())
+}
+
+fn ollama_timeout() -> Duration {
+    let seconds = env::var("OLLAMA_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (30..=600).contains(value))
+        .unwrap_or(DEFAULT_OLLAMA_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds)
 }
 
 fn unsupported_app_request(request: &str) -> Option<Intent> {
@@ -356,11 +366,21 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
     }
     let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b-instruct".to_string());
     let body = json!({"model": model, "stream": false, "format": "json", "options": {"temperature": 0}, "messages": [{"role": "system", "content": system_prompt()}, {"role": "user", "content": request}]});
+    let timeout = ollama_timeout();
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .build()
         .map_err(|_| "Could not initialize the local Ollama client.".to_string())?;
-    let response = client.post(OLLAMA_API_URL).json(&body).send().await.map_err(|_| "Could not reach Ollama. Install Ollama, keep it running, and download the selected model first.".to_string())?;
+    let response = client.post(OLLAMA_API_URL).json(&body).send().await.map_err(|error| {
+        if error.is_timeout() {
+            format!(
+                "Ollama took longer than {} seconds. CPU-only virtual machines can be slow; try again or set OLLAMA_TIMEOUT_SECONDS up to 600.",
+                timeout.as_secs()
+            )
+        } else {
+            "Could not reach Ollama. Check `systemctl status ollama` and confirm the selected model is installed.".to_string()
+        }
+    })?;
     let status = response.status();
     let response_text = response
         .text()
