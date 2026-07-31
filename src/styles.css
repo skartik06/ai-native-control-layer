@@ -9,6 +9,7 @@ kbd { margin-left: auto; border: 1px solid #344462; border-radius: 5px; padding:
 .history-toggle { margin-left: auto; border: 1px solid #425474; border-radius: 5px; padding: 4px 7px; background: transparent; color: #b9c8e4; font: 700 10px/1 inherit; letter-spacing: .04em; cursor: pointer; }
 .history-toggle:disabled { opacity: .6; cursor: wait; }
 .history-toggle + kbd { margin-left: 0; }
+.stop-button { border: 1px solid #b55b68; border-radius: 5px; padding: 4px 7px; background: rgba(181, 91, 104, .12); color: #ffb8c0; font: 700 10px/1 inherit; letter-spacing: .04em; cursor: pointer; }
 form { border-top: 1px solid #27344e; border-bottom: 1px solid #27344e; }
 input { width: 100%; border: 0; outline: 0; padding: 21px 18px; background: transparent; color: #fff; font: 500 18px/1.4 inherit; }
 input::placeholder { color: #70809d; }

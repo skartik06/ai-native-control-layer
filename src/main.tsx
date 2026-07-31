@@ -36,6 +36,10 @@ type AuditEntry = {
   summary: string;
 };
 
+function readableError(error: unknown) {
+  return String(error).replace(/^Error:\s*/, "");
+}
+
 function App() {
   const [input, setInput] = useState("");
   const [response, setResponse] = useState("");
@@ -92,8 +96,18 @@ function App() {
       }
       setInput("");
     } catch (error) {
-      setResponse(`Could not parse intent: ${String(error)}`);
+      setResponse(`Request could not be completed. ${readableError(error)}`);
     } finally { setLoading(false); }
+  }
+
+  async function stopCurrentRequest() {
+    if (!isTauri || !loading) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setResponse(await invoke<string>("stop_request"));
+    } catch (error) {
+      setResponse(`Could not stop the request. ${readableError(error)}`);
+    }
   }
 
   async function confirm() {
@@ -144,7 +158,7 @@ function App() {
 
   return <main className="overlay-shell">
     <section className="command-palette" aria-label="AI Native Control Layer">
-      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>CONTROL LAYER</span><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button><kbd>Ctrl Space</kbd></div>
+      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>CONTROL LAYER</span><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button>{loading && <button className="stop-button" type="button" onClick={stopCurrentRequest}>Stop</button>}<kbd>Ctrl Space</kbd></div>
       <form onSubmit={submit}>
         <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
           placeholder="Ask your computer anything..." aria-label="Command input" />

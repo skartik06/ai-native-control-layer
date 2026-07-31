@@ -16,6 +16,7 @@ use std::{
 };
 use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager, State};
+use tokio::sync::oneshot;
 
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
 const OLLAMA_TAGS_URL: &str = "http://127.0.0.1:11434/api/tags";
@@ -30,6 +31,7 @@ enum Action {
     GetNetworkStatus,
     ToggleSetting,
     ReadRecentLogs,
+    LaunchApp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -62,6 +64,7 @@ struct IntentParams {
     value: Option<serde_json::Value>,
     service_name: Option<String>,
     lines: Option<u32>,
+    app_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -186,6 +189,45 @@ fn unsupported_app_request(request: &str) -> Option<Intent> {
     } else {
         None
     }
+}
+
+fn local_launch_request(request: &str) -> Option<Intent> {
+    let normalized = request.to_lowercase();
+    let asks_to_launch = ["open", "opn", "launch", "lauch", "start"]
+        .iter()
+        .any(|verb| normalized.contains(verb));
+    if !asks_to_launch {
+        return None;
+    }
+    let app_name = if ["file manager", "file explorer", "files", "folder"]
+        .iter()
+        .any(|name| normalized.contains(name))
+    {
+        "file_manager"
+    } else if ["browser", "firefox", "chrome", "browsr", "broser"]
+        .iter()
+        .any(|name| normalized.contains(name))
+    {
+        "browser"
+    } else if ["terminal", "termnal", "command line"]
+        .iter()
+        .any(|name| normalized.contains(name))
+    {
+        "terminal"
+    } else {
+        return None;
+    };
+    Some(Intent {
+        action: Action::LaunchApp,
+        params: IntentParams {
+            app_name: Some(app_name.to_string()),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
 }
 
 fn small_talk_request(request: &str) -> Option<Intent> {
@@ -410,13 +452,26 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
         {
             Err("Ollama omitted required log parameters. No action was taken.".to_string())
         }
+        Action::LaunchApp
+            if params.app_name.is_none()
+                || params.query.is_some()
+                || params.filters.is_some()
+                || params.directory.is_some()
+                || params.threshold_mb.is_some()
+                || params.setting_name.is_some()
+                || params.value.is_some()
+                || params.service_name.is_some()
+                || params.lines.is_some() =>
+        {
+            Err("App launch requires one supported app name. No action was taken.".to_string())
+        }
         _ => Ok(()),
     }
 }
 
 fn planned_risk(action: Action) -> RiskTier {
     match action {
-        Action::ToggleSetting => RiskTier::Medium,
+        Action::ToggleSetting | Action::LaunchApp => RiskTier::Medium,
         Action::SearchFiles
         | Action::GetSystemInfo
         | Action::ListLargeFiles
@@ -433,6 +488,9 @@ fn plan_intent(intent: &Intent) -> Result<RiskTier, String> {
     }
     if matches!(intent.action, Action::ToggleSetting) {
         prepare_toggle(&intent.params)?;
+    }
+    if matches!(intent.action, Action::LaunchApp) {
+        prepare_launch(&intent.params)?;
     }
     Ok(expected_risk)
 }
@@ -502,14 +560,44 @@ fn toggle_preview(setting: &ToggleSetting) -> String {
     }
 }
 
-#[tauri::command]
-async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String> {
+fn prepare_launch(params: &IntentParams) -> Result<LaunchTarget, String> {
+    match params.app_name.as_deref().map(str::trim) {
+        Some("file_manager") => Ok(LaunchTarget::FileManager),
+        Some("browser") => Ok(LaunchTarget::Browser),
+        Some("terminal") => Ok(LaunchTarget::Terminal),
+        _ => Err("Only the file manager, browser, and terminal can be launched in this MVP. No action was taken.".to_string()),
+    }
+}
+
+fn launch_preview(target: &LaunchTarget) -> String {
+    match target {
+        LaunchTarget::FileManager => {
+            "Open the default file manager at your home folder.".to_string()
+        }
+        LaunchTarget::Browser => "Open the default web browser.".to_string(),
+        LaunchTarget::Terminal => "Open the default terminal.".to_string(),
+    }
+}
+
+async fn parse_intent_internal(
+    app: AppHandle,
+    request: String,
+    cancellation: Option<&mut oneshot::Receiver<()>>,
+) -> Result<Intent, String> {
     let request = request.trim();
     if request.is_empty() {
         return Err("Enter a request first.".to_string());
     }
     if request.len() > 4_000 {
         return Err("Request is too long (maximum 4,000 characters).".to_string());
+    }
+    if let Some(intent) = local_launch_request(request) {
+        append_debug_log(
+            &app,
+            request,
+            "Locally parsed a whitelisted app launch request.",
+        );
+        return Ok(intent);
     }
     if let Some(clarification) = unsupported_app_request(request) {
         append_debug_log(
@@ -564,7 +652,15 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
             {"role": "user", "content": request}
         ]
     });
-    let response = client.post(OLLAMA_API_URL).json(&body).send().await.map_err(|error| {
+    let request_future = client.post(OLLAMA_API_URL).json(&body).send();
+    let send_result = match cancellation {
+        Some(receiver) => tokio::select! {
+            result = request_future => result,
+            _ = receiver => return Err("Request cancelled. No action was taken.".to_string()),
+        },
+        None => request_future.await,
+    };
+    let response = send_result.map_err(|error| {
         if error.is_timeout() {
             format!(
                 "Ollama took longer than {} seconds. CPU-only virtual machines can be slow; try again or set OLLAMA_TIMEOUT_SECONDS up to 600.",
@@ -601,6 +697,11 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
     Ok(intent)
 }
 
+#[tauri::command]
+async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String> {
+    parse_intent_internal(app, request, None).await
+}
+
 const MAX_RESULTS: usize = 50;
 const MAX_WALK_DEPTH: usize = 8;
 
@@ -633,8 +734,21 @@ enum ToggleSetting {
     DoNotDisturb { enabled: bool },
 }
 
+#[derive(Clone)]
+enum LaunchTarget {
+    FileManager,
+    Browser,
+    Terminal,
+}
+
+#[derive(Clone)]
+enum PendingOperation {
+    Toggle(ToggleSetting),
+    Launch(LaunchTarget),
+}
+
 struct PendingAction {
-    setting: ToggleSetting,
+    operation: PendingOperation,
     audit: AuditContext,
     created_at: Instant,
 }
@@ -642,6 +756,14 @@ struct PendingAction {
 struct PendingConfirmation(Mutex<Option<PendingAction>>);
 
 impl Default for PendingConfirmation {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+struct RequestCancellation(Mutex<Option<oneshot::Sender<()>>>);
+
+impl Default for RequestCancellation {
     fn default() -> Self {
         Self(Mutex::new(None))
     }
@@ -1162,6 +1284,39 @@ fn execute_toggle(_: &ToggleSetting) -> Result<ToolExecution, String> {
     Err("Settings changes are available in the Linux desktop MVP only.".to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn execute_launch(target: &LaunchTarget) -> Result<ToolExecution, String> {
+    let mut command = match target {
+        LaunchTarget::FileManager => {
+            let mut command = Command::new("xdg-open");
+            command.arg(user_root()?);
+            command
+        }
+        LaunchTarget::Browser => {
+            let mut command = Command::new("xdg-open");
+            command.arg("https://example.com");
+            command
+        }
+        LaunchTarget::Terminal => Command::new("x-terminal-emulator"),
+    };
+    command.spawn().map_err(|_| {
+        format!(
+            "Could not launch {}. Check that the desktop application is installed.",
+            launch_preview(target)
+        )
+    })?;
+    Ok(ToolExecution {
+        tool: "launch_app".to_string(),
+        summary: format!("Launched: {}", launch_preview(target)),
+        data: json!({"launched": true}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_launch(_: &LaunchTarget) -> Result<ToolExecution, String> {
+    Err("App launching is available in the Linux desktop MVP only.".to_string())
+}
+
 fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
     match intent.action {
         Action::SearchFiles => search_files(&intent.params),
@@ -1172,6 +1327,9 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
         Action::ToggleSetting => {
             Err("Settings changes must pass through the confirmation gate.".to_string())
         }
+        Action::LaunchApp => {
+            Err("App launching must pass through the confirmation gate.".to_string())
+        }
     }
 }
 
@@ -1179,9 +1337,24 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
 async fn process_request(
     app: AppHandle,
     pending_confirmation: State<'_, PendingConfirmation>,
+    request_cancellation: State<'_, RequestCancellation>,
     request: String,
 ) -> Result<ProcessResponse, String> {
-    let intent = parse_intent(app.clone(), request).await?;
+    let (sender, mut receiver) = oneshot::channel();
+    {
+        let mut current = request_cancellation
+            .0
+            .lock()
+            .map_err(|_| "The request control is unavailable.".to_string())?;
+        *current = Some(sender);
+    }
+    let parsed = parse_intent_internal(app.clone(), request, Some(&mut receiver)).await;
+    request_cancellation
+        .0
+        .lock()
+        .map_err(|_| "The request control is unavailable.".to_string())?
+        .take();
+    let intent = parsed?;
     let audit = AuditContext::from(&intent);
     if intent.clarification_needed {
         let message = intent
@@ -1247,8 +1420,27 @@ async fn process_request(
             }
         }
         RiskTier::Medium => {
-            let setting = prepare_toggle(&intent.params)?;
-            let preview = toggle_preview(&setting);
+            let (operation, preview) = match intent.action {
+                Action::ToggleSetting => {
+                    let setting = prepare_toggle(&intent.params)?;
+                    (
+                        PendingOperation::Toggle(setting.clone()),
+                        toggle_preview(&setting),
+                    )
+                }
+                Action::LaunchApp => {
+                    let target = prepare_launch(&intent.params)?;
+                    (
+                        PendingOperation::Launch(target.clone()),
+                        launch_preview(&target),
+                    )
+                }
+                _ => {
+                    return Err(
+                        "Unsupported confirmation operation. No action was taken.".to_string()
+                    )
+                }
+            };
             record_audit(
                 &app,
                 &audit,
@@ -1261,7 +1453,7 @@ async fn process_request(
                 "The confirmation gate is unavailable. No action was taken.".to_string()
             })?;
             *pending = Some(PendingAction {
-                setting,
+                operation,
                 audit,
                 created_at: Instant::now(),
             });
@@ -1285,6 +1477,21 @@ async fn process_request(
                 confirmation: None,
             })
         }
+    }
+}
+
+#[tauri::command]
+fn stop_request(request_cancellation: State<'_, RequestCancellation>) -> Result<String, String> {
+    let sender = request_cancellation
+        .0
+        .lock()
+        .map_err(|_| "The request control is unavailable.".to_string())?
+        .take();
+    if let Some(sender) = sender {
+        let _ = sender.send(());
+        Ok("Stopping the current request. No action was taken.".to_string())
+    } else {
+        Ok("There is no request currently waiting for Ollama.".to_string())
     }
 }
 
@@ -1323,7 +1530,11 @@ fn confirm_pending_action(
         "User confirmed the previewed setting change.",
         None,
     )?;
-    match execute_toggle(&pending.setting) {
+    let execution_result = match &pending.operation {
+        PendingOperation::Toggle(setting) => execute_toggle(setting),
+        PendingOperation::Launch(target) => execute_launch(target),
+    };
+    match execution_result {
         Ok(mut execution) => {
             let result = serde_json::to_value(&execution)
                 .map_err(|_| "Could not serialize the tool result.".to_string())?;
@@ -1411,9 +1622,11 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PendingConfirmation::default())
+        .manage(RequestCancellation::default())
         .invoke_handler(tauri::generate_handler![
             parse_intent,
             process_request,
+            stop_request,
             confirm_pending_action,
             cancel_pending_action,
             get_audit_history
