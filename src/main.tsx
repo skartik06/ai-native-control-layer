@@ -66,6 +66,7 @@ function App() {
   const [memory, setMemory] = useState<MemoryEntry[] | null>(null);
   const [memoryKey, setMemoryKey] = useState("");
   const [memoryValue, setMemoryValue] = useState("");
+  const [mode, setMode] = useState<"control" | "chat">("control");
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -112,6 +113,11 @@ function App() {
     setLoading(true); setResponse("");
     try {
       const { invoke } = await import("@tauri-apps/api/core");
+      if (mode === "chat") {
+        setResponse(await invoke<string>("chat_with_assistant", { message: request }));
+        setInput("");
+        return;
+      }
       const result = await invoke<ProcessResult>("process_request", { request });
       if (result.confirmation) {
         setConfirmation(result.confirmation);
@@ -225,11 +231,11 @@ function App() {
         <h1>What can I help you do?</h1>
         <p>Control your Linux desktop, inspect your system, and safely launch supported apps. Voice and opt-in personal memory are next.</p>
         {runtimeProfile && <p className="runtime-summary">{runtimeProfile.summary} Detected: {runtimeProfile.total_memory_gb} GB RAM · {runtimeProfile.cpu_cores} CPU cores.</p>}
-        <div className="capability-row"><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span><span>Audit trail</span></div>
+        <div className="capability-row"><button className={mode === "control" ? "mode-active" : ""} type="button" onClick={() => setMode("control")}>Control mode</button><button className={mode === "chat" ? "mode-active" : ""} type="button" onClick={() => setMode("chat")}>Chat mode</button><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span></div>
       </section>
       <form onSubmit={submit}>
         <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
-          placeholder="Try: open file manager, show Wi-Fi status, or turn on dark mode" aria-label="Command input" />
+          placeholder={mode === "chat" ? "Ask a general question (uses your local model)" : "Try: open file manager, show Wi-Fi status, or turn on dark mode"} aria-label="Command input" />
       </form>
       {confirmation && <section className="confirmation" aria-label="Confirm setting change">
         <p>Preview: {confirmation.summary}</p>
@@ -253,7 +259,7 @@ function App() {
         <form className="memory-form" onSubmit={saveMemory}><input value={memoryKey} onChange={(event) => setMemoryKey(event.target.value)} placeholder="Preference, e.g. preferred browser" /><input value={memoryValue} onChange={(event) => setMemoryValue(event.target.value)} placeholder="Value, e.g. Firefox" /><button type="submit">Save memory</button></form>
         {memory.length === 0 ? <p className="empty-history">No saved memories.</p> : <ul>{memory.map((entry) => <li key={entry.id}><div><code>{entry.memory_key}</code><button type="button" onClick={() => void removeMemory(entry.id)}>Forget</button></div><p>{entry.value}</p></li>)}</ul>}
       </section>}
-      <p className="hint">{loading ? "Working — use Stop to cancel a waiting Ollama request." : confirmation ? "Nothing changes until you confirm." : "Read-only checks run automatically. App launches and settings need confirmation."}</p>
+      <p className="hint">{loading ? "Working — use Stop to cancel a waiting Ollama request." : mode === "chat" ? "Chat never performs system actions. Switch to Control mode for computer tasks." : confirmation ? "Nothing changes until you confirm." : "Read-only checks run automatically. App launches and settings need confirmation."}</p>
     </section>
   </main>;
 }

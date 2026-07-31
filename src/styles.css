@@ -21,6 +21,8 @@ input::placeholder { color: #70809d; }
 .eyebrow { margin: 0; color: #76ddb2; font-size: 10px; font-weight: 800; letter-spacing: .12em; }
 .capability-row { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 17px; }
 .capability-row span { border: 1px solid #33435f; border-radius: 99px; padding: 5px 8px; color: #c3d1e8; background: rgba(6, 12, 24, .35); font-size: 11px; }
+.capability-row button { border: 1px solid #45607c; border-radius: 99px; padding: 5px 9px; color: #b8cae7; background: transparent; font: 700 11px/1 inherit; cursor: pointer; }
+.capability-row button.mode-active { border-color: #68e8b2; color: #0e251e; background: #68e8b2; }
 .response { max-height: 220px; margin: 0; overflow: auto; padding: 16px 18px; color: #c9d8f6; white-space: pre-wrap; background: rgba(91, 129, 195, .12); font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .audit-history { max-height: 245px; overflow: auto; padding: 14px 18px; border-bottom: 1px solid #27344e; background: rgba(26, 42, 70, .36); }
 .audit-heading { display: flex; justify-content: space-between; gap: 12px; color: #dce7fb; font-size: 12px; }

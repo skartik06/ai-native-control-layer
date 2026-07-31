@@ -702,6 +702,52 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
     parse_intent_internal(app, request, None).await
 }
 
+#[tauri::command]
+async fn chat_with_assistant(app: AppHandle, message: String) -> Result<String, String> {
+    let message = message.trim();
+    if message.is_empty() || message.len() > 4_000 {
+        return Err("Enter a message under 4,000 characters.".to_string());
+    }
+    let timeout = ollama_timeout();
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|_| "Could not initialize the local assistant model.".to_string())?;
+    let model = selected_ollama_model(&client).await;
+    let body = json!({
+        "model": model,
+        "stream": false,
+        "think": false,
+        "options": {"temperature": 0.7, "num_ctx": 4096, "num_predict": 512},
+        "messages": [
+            {"role": "system", "content": "You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions."},
+            {"role": "user", "content": message}
+        ]
+    });
+    let response = client
+        .post(OLLAMA_API_URL)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "The local chat model is still thinking. On a VM this can be slow; use a direct Linux GPU install for fast conversational replies.".to_string()
+            } else {
+                "Could not reach the local chat model. Check that Ollama is running.".to_string()
+            }
+        })?;
+    if !response.status().is_success() {
+        return Err("The selected local chat model is unavailable. Run `ollama list` and restart the assistant.".to_string());
+    }
+    let api_response: OllamaResponse = response
+        .json()
+        .await
+        .map_err(|_| "The local chat model returned an unreadable reply.".to_string())?;
+    let reply = final_model_output(&api_response.message.content).to_string();
+    append_debug_log(&app, message, &reply);
+    Ok(reply)
+}
+
 const MAX_RESULTS: usize = 50;
 const MAX_WALK_DEPTH: usize = 8;
 
@@ -1748,6 +1794,7 @@ fn main() {
         .manage(RequestCancellation::default())
         .invoke_handler(tauri::generate_handler![
             parse_intent,
+            chat_with_assistant,
             process_request,
             stop_request,
             confirm_pending_action,
