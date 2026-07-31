@@ -43,6 +43,8 @@ The intent request disables Qwen3 thinking and limits its context/output to the 
 OLLAMA_TIMEOUT_SECONDS=600 OLLAMA_MODEL=qwen3:4b pnpm tauri dev
 ```
 
+Explicitly saved memory is used only as contextual information for Chat mode. It is never created from raw chat automatically, is never sent to a cloud service by this app, and can be reviewed or deleted in the **Memory** panel.
+
 ## Current MVP scope
 
 The action planner independently validates every model response. It rejects unrecognised parameters, confidence below 0.9, and a model-selected risk tier that does not match the tool.

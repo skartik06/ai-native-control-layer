@@ -800,6 +800,18 @@ async fn parse_intent_internal(
         .build()
         .map_err(|_| "Could not initialize the local Ollama client.".to_string())?;
     let model = selected_ollama_model(&client).await;
+    let memory_context = get_memory(app.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .take(20)
+        .map(|entry| format!("- {}: {}", entry.memory_key, entry.value))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system_message = if memory_context.is_empty() {
+        "You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions.".to_string()
+    } else {
+        format!("You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions. The following are user-approved local preferences; use them only when relevant, never reveal them unless asked, and do not claim to have learned anything else:\n{memory_context}")
+    };
     let body = json!({
         "model": model,
         "stream": false,
@@ -893,7 +905,7 @@ async fn chat_with_assistant(
         "think": false,
         "options": {"temperature": 0.7, "num_ctx": 4096, "num_predict": 512},
         "messages": [
-            {"role": "system", "content": "You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions."},
+            {"role": "system", "content": system_message},
             {"role": "user", "content": message}
         ]
     });
