@@ -188,6 +188,39 @@ fn unsupported_app_request(request: &str) -> Option<Intent> {
     }
 }
 
+fn small_talk_request(request: &str) -> Option<Intent> {
+    let normalized = request
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| character.is_alphanumeric() || character.is_whitespace())
+        .collect::<String>();
+    let is_greeting = [
+        "hi",
+        "hello",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    ]
+    .iter()
+    .any(|greeting| normalized.trim() == *greeting);
+    if is_greeting {
+        Some(Intent {
+            action: Action::GetSystemInfo,
+            params: IntentParams::default(),
+            risk_tier: RiskTier::Low,
+            confidence: 1.0,
+            clarification_needed: true,
+            clarification_question: Some(
+                "Hi! I can safely check system information, Wi-Fi status, files, large files, or recent service logs. What would you like to do?".to_string(),
+            ),
+        })
+    } else {
+        None
+    }
+}
+
 fn local_toggle_request(request: &str) -> Option<Intent> {
     let request = request.to_lowercase();
     let setting_name = if request.contains("dark mode") || request.contains("light mode") {
@@ -447,6 +480,14 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
             &app,
             request,
             "Locally rejected unsupported app-launch request.",
+        );
+        return Ok(clarification);
+    }
+    if let Some(clarification) = small_talk_request(request) {
+        append_debug_log(
+            &app,
+            request,
+            "Locally handled a greeting without calling Ollama.",
         );
         return Ok(clarification);
     }
@@ -1421,6 +1462,15 @@ mod tests {
     fn app_launch_requests_are_rejected_before_the_model() {
         let result = unsupported_app_request("open the file manager");
         assert!(result.is_some_and(|intent| intent.clarification_needed));
+    }
+
+    #[test]
+    fn greetings_return_a_helpful_clarification_without_ollama() {
+        let intent = small_talk_request("Hi!").expect("greeting should be handled locally");
+        assert!(intent.clarification_needed);
+        assert!(intent
+            .clarification_question
+            .is_some_and(|message| message.contains("safely check")));
     }
 
     #[test]
