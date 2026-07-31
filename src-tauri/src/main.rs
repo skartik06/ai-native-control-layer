@@ -34,6 +34,7 @@ enum Action {
     LaunchApp,
     MediaControl,
     SendNotification,
+    TakeScreenshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -422,6 +423,21 @@ fn local_notification_request(request: &str) -> Option<Intent> {
     })
 }
 
+fn local_screenshot_request(request: &str) -> Option<Intent> {
+    let request = request.to_lowercase();
+    (["screenshot", "screen shot", "capture screen"]
+        .iter()
+        .any(|term| request.contains(term)))
+    .then(|| Intent {
+        action: Action::TakeScreenshot,
+        params: IntentParams::default(),
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
 fn select_available_model(models: &[OllamaModel]) -> Option<String> {
     ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
         .iter()
@@ -593,6 +609,7 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
         {
             Err("A notification needs a message of at most 280 characters. No action was taken.".to_string())
         }
+        Action::TakeScreenshot if params.query.is_some() || params.filters.is_some() || params.directory.is_some() || params.threshold_mb.is_some() || params.setting_name.is_some() || params.value.is_some() || params.service_name.is_some() || params.lines.is_some() || params.app_name.is_some() || params.media_command.is_some() || params.notification_body.is_some() => Err("Screenshot capture does not accept extra parameters. No action was taken.".to_string()),
         _ => Ok(()),
     }
 }
@@ -602,7 +619,8 @@ fn planned_risk(action: Action) -> RiskTier {
         Action::ToggleSetting
         | Action::LaunchApp
         | Action::MediaControl
-        | Action::SendNotification => RiskTier::Medium,
+        | Action::SendNotification
+        | Action::TakeScreenshot => RiskTier::Medium,
         Action::SearchFiles
         | Action::GetSystemInfo
         | Action::ListLargeFiles
@@ -823,6 +841,9 @@ async fn parse_intent_internal(
             request,
             "Locally parsed a notification request before Ollama.",
         );
+        return Ok(intent);
+    }
+    if let Some(intent) = local_screenshot_request(request) {
         return Ok(intent);
     }
     let timeout = ollama_timeout();
@@ -1051,6 +1072,7 @@ enum PendingOperation {
     Launch(LaunchTarget),
     Media(MediaCommand),
     Notification(String),
+    Screenshot,
 }
 
 struct PendingAction {
@@ -1813,6 +1835,33 @@ fn execute_notification(_: &str) -> Result<ToolExecution, String> {
     Err("Desktop notifications are available in the Linux desktop MVP only.".to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn execute_screenshot() -> Result<ToolExecution, String> {
+    let pictures = user_root()?.join("Pictures");
+    fs::create_dir_all(&pictures)
+        .map_err(|_| "Could not create the Pictures folder.".to_string())?;
+    let path = pictures.join(format!(
+        "linux-assistant-{}.png",
+        Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    Command::new("gnome-screenshot")
+        .args(["-f", path.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|_| {
+            "Could not run gnome-screenshot. Install it on this Linux desktop.".to_string()
+        })?;
+    Ok(ToolExecution {
+        tool: "take_screenshot".to_string(),
+        summary: format!("Saved screenshot to {}.", path.display()),
+        data: json!({"path": path}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_screenshot() -> Result<ToolExecution, String> {
+    Err("Screenshot capture is available in the Linux desktop build only.".to_string())
+}
+
 fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
     match intent.action {
         Action::SearchFiles => search_files(&intent.params),
@@ -1831,6 +1880,9 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
         }
         Action::SendNotification => {
             Err("Desktop notifications must pass through the confirmation gate.".to_string())
+        }
+        Action::TakeScreenshot => {
+            Err("Screenshot capture must pass through the confirmation gate.".to_string())
         }
     }
 }
@@ -1949,6 +2001,10 @@ async fn process_request(
                     let preview = format!("Send a desktop notification: {body}");
                     (PendingOperation::Notification(body), preview)
                 }
+                Action::TakeScreenshot => (
+                    PendingOperation::Screenshot,
+                    "Capture the current screen and save it in Pictures.".to_string(),
+                ),
                 _ => {
                     return Err(
                         "Unsupported confirmation operation. No action was taken.".to_string()
@@ -2049,6 +2105,7 @@ fn confirm_pending_action(
         PendingOperation::Launch(target) => execute_launch(target),
         PendingOperation::Media(command) => execute_media(command),
         PendingOperation::Notification(body) => execute_notification(body),
+        PendingOperation::Screenshot => execute_screenshot(),
     };
     match execution_result {
         Ok(mut execution) => {
