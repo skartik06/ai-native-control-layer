@@ -90,7 +90,7 @@ Each push to `main` also runs a Linux compilation check in GitHub Actions.
 
 ## Linux release packages (Step 7)
 
-The **Package Linux desktop app** GitHub Actions workflow produces a Debian package (`.deb`) and portable AppImage. Run it manually from the repository's **Actions** tab, or create and push a version tag such as `v0.1.0`. Download the `ai-native-control-layer-linux` artifact from the completed run. On Debian/Kali/Ubuntu, install the downloaded Debian package with:
+The **Package Linux desktop app** GitHub Actions workflow produces a Debian package (`.deb`) and portable AppImage. Run it manually from the repository's **Actions** tab, or create and push a version tag such as `v0.1.0`. Manual runs upload an `ai-native-control-layer-linux` workflow artifact. A version tag also creates a GitHub Release with both files attached as direct downloads. On Debian/Kali/Ubuntu, install the downloaded Debian package with:
 
 ```bash
 sudo apt install ./ai-native-control-layer_0.1.0_amd64.deb
