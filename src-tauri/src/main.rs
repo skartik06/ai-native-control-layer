@@ -18,6 +18,7 @@ use sysinfo::{Disks, System};
 use tauri::{AppHandle, Manager, State};
 
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
+const OLLAMA_TAGS_URL: &str = "http://127.0.0.1:11434/api/tags";
 const DEFAULT_OLLAMA_TIMEOUT_SECONDS: u64 = 180;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -107,6 +108,16 @@ struct OllamaMessage {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaModel>,
+}
+
+#[derive(Deserialize)]
+struct OllamaModel {
+    name: String,
+}
+
 fn system_prompt() -> &'static str {
     r#"You are the intent parser for a safety-first Linux desktop assistant. Return ONLY one JSON object, with no Markdown or explanation. It must have action, params, risk_tier, confidence, clarification_needed, and clarification_question keys.
 
@@ -179,7 +190,7 @@ fn unsupported_app_request(request: &str) -> Option<Intent> {
 
 fn local_toggle_request(request: &str) -> Option<Intent> {
     let request = request.to_lowercase();
-    let setting_name = if request.contains("dark mode") {
+    let setting_name = if request.contains("dark mode") || request.contains("light mode") {
         "dark_mode"
     } else if request.contains("do not disturb") || request.contains("dnd") {
         "do_not_disturb"
@@ -194,11 +205,14 @@ fn local_toggle_request(request: &str) -> Option<Intent> {
     let disable = ["turn off", "disable", "switch off"]
         .iter()
         .any(|phrase| request.contains(phrase));
-    let value = match (enable, disable) {
+    let mut value = match (enable, disable) {
         (true, false) => true,
         (false, true) => false,
         _ => return None,
     };
+    if request.contains("light mode") {
+        value = !value;
+    }
     Some(Intent {
         action: Action::ToggleSetting,
         params: IntentParams {
@@ -211,6 +225,41 @@ fn local_toggle_request(request: &str) -> Option<Intent> {
         clarification_needed: false,
         clarification_question: None,
     })
+}
+
+fn select_available_model(models: &[OllamaModel]) -> Option<String> {
+    ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
+        .iter()
+        .find_map(|preferred| {
+            models
+                .iter()
+                .find(|model| model.name == *preferred)
+                .map(|model| model.name.clone())
+        })
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| model.name.starts_with("qwen3:"))
+                .map(|model| model.name.clone())
+        })
+        .or_else(|| models.first().map(|model| model.name.clone()))
+}
+
+async fn selected_ollama_model(client: &Client) -> String {
+    if let Ok(model) = env::var("OLLAMA_MODEL") {
+        if !model.trim().is_empty() {
+            return model;
+        }
+    }
+    match client.get(OLLAMA_TAGS_URL).send().await {
+        Ok(response) if response.status().is_success() => response
+            .json::<OllamaTagsResponse>()
+            .await
+            .ok()
+            .and_then(|tags| select_available_model(&tags.models))
+            .unwrap_or_else(|| "qwen3:4b-instruct".to_string()),
+        _ => "qwen3:4b-instruct".to_string(),
+    }
 }
 
 fn validate_intent(intent: &Intent) -> Result<(), String> {
@@ -409,7 +458,12 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
         );
         return Ok(intent);
     }
-    let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b-instruct".to_string());
+    let timeout = ollama_timeout();
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|_| "Could not initialize the local Ollama client.".to_string())?;
+    let model = selected_ollama_model(&client).await;
     let body = json!({
         "model": model,
         "stream": false,
@@ -425,11 +479,6 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
             {"role": "user", "content": request}
         ]
     });
-    let timeout = ollama_timeout();
-    let client = Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|_| "Could not initialize the local Ollama client.".to_string())?;
     let response = client.post(OLLAMA_API_URL).json(&body).send().await.map_err(|error| {
         if error.is_timeout() {
             format!(
@@ -448,8 +497,8 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
     if !status.is_success() {
         append_debug_log(&app, request, &response_text);
         return Err(format!(
-            "Ollama returned HTTP {}. Run `ollama run qwen3:4b` once, then try again.",
-            status
+            "Ollama returned HTTP {} for model '{}'. Run `ollama list`, then set OLLAMA_MODEL to one of the listed models and restart the app.",
+            status, body["model"].as_str().unwrap_or("unknown")
         ));
     }
     let api_response: OllamaResponse = serde_json::from_str(&response_text)
@@ -1382,6 +1431,25 @@ mod tests {
         assert!(matches!(intent.risk_tier, RiskTier::Medium));
         assert_eq!(intent.params.setting_name.as_deref(), Some("dark_mode"));
         assert_eq!(intent.params.value, Some(json!(true)));
+    }
+
+    #[test]
+    fn light_mode_request_maps_to_dark_mode_off() {
+        let intent = local_toggle_request("turn on light mode")
+            .expect("light mode should be parsed locally");
+        assert_eq!(intent.params.setting_name.as_deref(), Some("dark_mode"));
+        assert_eq!(intent.params.value, Some(json!(false)));
+    }
+
+    #[test]
+    fn model_selector_prefers_an_installed_small_qwen_model() {
+        let models = vec![OllamaModel {
+            name: "qwen3:1.7b".to_string(),
+        }];
+        assert_eq!(
+            select_available_model(&models).as_deref(),
+            Some("qwen3:1.7b")
+        );
     }
 
     #[test]
