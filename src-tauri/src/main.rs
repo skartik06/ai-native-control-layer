@@ -877,6 +877,8 @@ async fn chat_with_assistant(
     }
     if let Some(reply) = local_chat_reply(message) {
         append_debug_log(&app, message, &reply);
+        record_chat_entry(&app, "user", message)?;
+        record_chat_entry(&app, "assistant", &reply)?;
         return Ok(reply);
     }
     let timeout = ollama_timeout();
@@ -931,6 +933,8 @@ async fn chat_with_assistant(
         .map_err(|_| "The local chat model returned an unreadable reply.".to_string())?;
     let reply = final_model_output(&api_response.message.content).to_string();
     append_debug_log(&app, message, &reply);
+    record_chat_entry(&app, "user", message)?;
+    record_chat_entry(&app, "assistant", &reply)?;
     Ok(reply)
 }
 
@@ -1166,6 +1170,14 @@ struct MemoryEntry {
     value: String,
 }
 
+#[derive(Serialize)]
+struct ChatEntry {
+    id: i64,
+    created_at: String,
+    role: String,
+    content: String,
+}
+
 fn open_audit_database(app: &AppHandle) -> Result<Connection, String> {
     let data_dir = app
         .path()
@@ -1204,9 +1216,27 @@ fn initialize_audit_database(connection: &Connection) -> Result<(), String> {
                 memory_key TEXT NOT NULL,
                 value TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS assistant_memory_created_at_idx ON assistant_memory(created_at DESC);",
+            CREATE INDEX IF NOT EXISTS assistant_memory_created_at_idx ON assistant_memory(created_at DESC);
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                content TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS chat_history_created_at_idx ON chat_history(created_at DESC);",
         )
         .map_err(|_| "Could not initialize the local audit database.".to_string())?;
+    Ok(())
+}
+
+fn record_chat_entry(app: &AppHandle, role: &str, content: &str) -> Result<(), String> {
+    let connection = open_audit_database(app)?;
+    connection
+        .execute(
+            "INSERT INTO chat_history (created_at, role, content) VALUES (?1, ?2, ?3)",
+            params![Utc::now().to_rfc3339(), role, content],
+        )
+        .map_err(|_| "Could not save local chat history.".to_string())?;
     Ok(())
 }
 
@@ -2154,6 +2184,38 @@ fn delete_all_memory(app: AppHandle) -> Result<String, String> {
     Ok("All opt-in assistant memory was deleted.".to_string())
 }
 
+#[tauri::command]
+fn get_chat_history(app: AppHandle, limit: Option<u32>) -> Result<Vec<ChatEntry>, String> {
+    let connection = open_audit_database(&app)?;
+    let limit = i64::from(limit.unwrap_or(50).clamp(1, 200));
+    let mut statement = connection
+        .prepare("SELECT id, created_at, role, content FROM chat_history ORDER BY id DESC LIMIT ?1")
+        .map_err(|_| "Could not read local chat history.".to_string())?;
+    let mut entries = statement
+        .query_map(params![limit], |row| {
+            Ok(ChatEntry {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+            })
+        })
+        .map_err(|_| "Could not read local chat history.".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read local chat history.".to_string())?;
+    entries.reverse();
+    Ok(entries)
+}
+
+#[tauri::command]
+fn delete_chat_history(app: AppHandle) -> Result<String, String> {
+    let connection = open_audit_database(&app)?;
+    connection
+        .execute("DELETE FROM chat_history", [])
+        .map_err(|_| "Could not clear local chat history.".to_string())?;
+    Ok("Local chat history was deleted.".to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -2173,7 +2235,9 @@ fn main() {
             remember_preference,
             get_memory,
             forget_memory,
-            delete_all_memory
+            delete_all_memory,
+            get_chat_history,
+            delete_chat_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");

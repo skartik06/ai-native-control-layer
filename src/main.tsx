@@ -57,6 +57,8 @@ type VoiceStatus = {
   summary: string;
 };
 
+type ChatEntry = { id: number; created_at: string; role: string; content: string };
+
 function readableError(error: unknown) {
   return String(error).replace(/^Error:\s*/, "");
 }
@@ -74,6 +76,7 @@ function App() {
   const [memoryValue, setMemoryValue] = useState("");
   const [mode, setMode] = useState<"control" | "chat">("control");
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
+  const [chatHistory, setChatHistory] = useState<ChatEntry[] | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -203,6 +206,22 @@ function App() {
     }
   }
 
+  async function toggleChatHistory() {
+    if (!isTauri) return;
+    if (chatHistory) { setChatHistory(null); return; }
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setChatHistory(await invoke<ChatEntry[]>("get_chat_history", { limit: 50 }));
+    } catch (error) { setResponse(`Could not load chat history. ${readableError(error)}`); }
+  }
+
+  async function clearChatHistory() {
+    if (!isTauri) return;
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("delete_chat_history");
+    setChatHistory([]);
+  }
+
   async function cancel() {
     if (!isTauri || !confirmation) return;
     try {
@@ -257,7 +276,7 @@ function App() {
         <h1>What can I help you do?</h1>
         <p>Control your Linux desktop, inspect your system, and safely launch supported apps. Your latest response can be spoken when a Linux speech engine is installed.</p>
         {runtimeProfile && <p className="runtime-summary">{runtimeProfile.summary} Detected: {runtimeProfile.total_memory_gb} GB RAM · {runtimeProfile.cpu_cores} CPU cores.</p>}
-        <div className="capability-row"><button className={mode === "control" ? "mode-active" : ""} type="button" onClick={() => setMode("control")}>Control mode</button><button className={mode === "chat" ? "mode-active" : ""} type="button" onClick={() => setMode("chat")}>Chat mode</button><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span><span title={voiceStatus?.summary}>{voiceStatus?.text_to_speech_available ? "Voice output ready" : "Voice output setup needed"}</span></div>
+        <div className="capability-row"><button className={mode === "control" ? "mode-active" : ""} type="button" onClick={() => setMode("control")}>Control mode</button><button className={mode === "chat" ? "mode-active" : ""} type="button" onClick={() => setMode("chat")}>Chat mode</button><button type="button" onClick={toggleChatHistory}>{chatHistory ? "Close chats" : "Chats"}</button><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span><span title={voiceStatus?.summary}>{voiceStatus?.text_to_speech_available ? "Voice output ready" : "Voice output setup needed"}</span></div>
       </section>
       <form onSubmit={submit}>
         <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
@@ -272,6 +291,7 @@ function App() {
         </div>
       </section>}
       {response && <><div className="response-tools"><button type="button" onClick={speakLatestResponse} disabled={!voiceStatus?.text_to_speech_available}>Speak response</button></div><pre className="response" role="status">{response}</pre></>}
+      {chatHistory && <section className="audit-history" aria-label="Local chat history"><div className="audit-heading"><strong>Local chat history</strong><button type="button" onClick={clearChatHistory}>Delete all</button></div>{chatHistory.length === 0 ? <p className="empty-history">No saved chat messages.</p> : <ul>{chatHistory.map((entry) => <li key={entry.id}><div><code>{entry.role}</code><time>{new Date(entry.created_at).toLocaleString()}</time></div><p>{entry.content}</p></li>)}</ul>}</section>}
       {history && <section className="audit-history" aria-label="Local audit history">
         <div className="audit-heading"><strong>Local audit history</strong><span>Latest {history.length} events</span></div>
         {history.length === 0 ? <p className="empty-history">No events recorded yet.</p> : <ul>{history.map((entry) => <li key={entry.id}>
