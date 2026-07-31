@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use reqwest::Client;
+use rusqlite::{params, Connection};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use std::{
@@ -500,6 +501,7 @@ enum ToggleSetting {
 
 struct PendingAction {
     setting: ToggleSetting,
+    audit: AuditContext,
     created_at: Instant,
 }
 
@@ -512,6 +514,110 @@ impl Default for PendingConfirmation {
 }
 
 const CONFIRMATION_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+struct AuditContext {
+    action: String,
+    risk_tier: String,
+    params_json: String,
+}
+
+impl From<&Intent> for AuditContext {
+    fn from(intent: &Intent) -> Self {
+        Self {
+            action: serde_json::to_string(&intent.action)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+            risk_tier: serde_json::to_string(&intent.risk_tier)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+            params_json: serde_json::to_string(&intent.params).unwrap_or_else(|_| "{}".to_string()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AuditEntry {
+    id: i64,
+    timestamp: String,
+    event_type: String,
+    action: String,
+    risk_tier: String,
+    params_json: String,
+    outcome: String,
+    summary: String,
+    result_json: Option<String>,
+}
+
+fn open_audit_database(app: &AppHandle) -> Result<Connection, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Could not locate the local audit data folder.".to_string())?;
+    fs::create_dir_all(&data_dir)
+        .map_err(|_| "Could not create the local audit data folder.".to_string())?;
+    let connection = Connection::open(data_dir.join("audit.sqlite3"))
+        .map_err(|_| "Could not open the local audit database.".to_string())?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|_| "Could not prepare the local audit database.".to_string())?;
+    initialize_audit_database(&connection)?;
+    Ok(connection)
+}
+
+fn initialize_audit_database(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                action TEXT NOT NULL,
+                risk_tier TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                result_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS audit_events_timestamp_idx ON audit_events(timestamp DESC);",
+        )
+        .map_err(|_| "Could not initialize the local audit database.".to_string())?;
+    Ok(())
+}
+
+fn record_audit(
+    app: &AppHandle,
+    context: &AuditContext,
+    event_type: &str,
+    outcome: &str,
+    summary: &str,
+    result: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let connection = open_audit_database(app)?;
+    let result_json = result
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| "Could not serialize an audit result.".to_string())?;
+    connection
+        .execute(
+            "INSERT INTO audit_events (timestamp, event_type, action, risk_tier, params_json, outcome, summary, result_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Utc::now().to_rfc3339(),
+                event_type,
+                &context.action,
+                &context.risk_tier,
+                &context.params_json,
+                outcome,
+                summary,
+                result_json,
+            ],
+        )
+        .map_err(|_| "Could not write the local audit event.".to_string())?;
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 fn user_root() -> Result<PathBuf, String> {
@@ -935,11 +1041,20 @@ async fn process_request(
     request: String,
 ) -> Result<ProcessResponse, String> {
     let intent = parse_intent(app, request).await?;
+    let audit = AuditContext::from(&intent);
     if intent.clarification_needed {
         let message = intent
             .clarification_question
             .clone()
             .unwrap_or_else(|| "Please clarify your request.".to_string());
+        record_audit(
+            &app,
+            &audit,
+            "clarification_requested",
+            "no_action",
+            &message,
+            None,
+        )?;
         return Ok(ProcessResponse {
             intent,
             execution: None,
@@ -947,25 +1062,66 @@ async fn process_request(
             confirmation: None,
         });
     }
-    match plan_intent(&intent)? {
+    let planned_risk = match plan_intent(&intent) {
+        Ok(risk) => risk,
+        Err(error) => {
+            record_audit(&app, &audit, "request_rejected", "rejected", &error, None)?;
+            return Err(error);
+        }
+    };
+    match planned_risk {
         RiskTier::Low => {
-            let execution = execute_low_risk(&intent)?;
-            let message = format!("{} No system changes were made.", execution.summary);
-            Ok(ProcessResponse {
-                intent,
-                execution: Some(execution),
-                message,
-                confirmation: None,
-            })
+            record_audit(
+                &app,
+                &audit,
+                "tool_started",
+                "pending",
+                "Executing a read-only tool.",
+                None,
+            )?;
+            match execute_low_risk(&intent) {
+                Ok(execution) => {
+                    let result = serde_json::to_value(&execution)
+                        .map_err(|_| "Could not serialize the tool result.".to_string())?;
+                    record_audit(
+                        &app,
+                        &audit,
+                        "tool_completed",
+                        "success",
+                        &execution.summary,
+                        Some(&result),
+                    )?;
+                    let message = format!("{} No system changes were made.", execution.summary);
+                    Ok(ProcessResponse {
+                        intent,
+                        execution: Some(execution),
+                        message,
+                        confirmation: None,
+                    })
+                }
+                Err(error) => {
+                    record_audit(&app, &audit, "tool_completed", "failed", &error, None)?;
+                    Err(error)
+                }
+            }
         }
         RiskTier::Medium => {
             let setting = prepare_toggle(&intent.params)?;
             let preview = toggle_preview(&setting);
+            record_audit(
+                &app,
+                &audit,
+                "confirmation_requested",
+                "pending_confirmation",
+                &preview,
+                None,
+            )?;
             let mut pending = pending_confirmation.0.lock().map_err(|_| {
                 "The confirmation gate is unavailable. No action was taken.".to_string()
             })?;
             *pending = Some(PendingAction {
                 setting,
+                audit,
                 created_at: Instant::now(),
             });
             Ok(ProcessResponse {
@@ -978,18 +1134,22 @@ async fn process_request(
                 }),
             })
         }
-        RiskTier::High => Ok(ProcessResponse {
-            intent,
-            execution: None,
-            message: "High-risk actions are out of scope for this MVP. Nothing was changed."
-                .to_string(),
-            confirmation: None,
-        }),
+        RiskTier::High => {
+            let message = "High-risk actions are out of scope for this MVP. Nothing was changed.";
+            record_audit(&app, &audit, "request_rejected", "rejected", message, None)?;
+            Ok(ProcessResponse {
+                intent,
+                execution: None,
+                message: message.to_string(),
+                confirmation: None,
+            })
+        }
     }
 }
 
 #[tauri::command]
 fn confirm_pending_action(
+    app: AppHandle,
     pending_confirmation: State<'_, PendingConfirmation>,
 ) -> Result<ToolExecution, String> {
     let pending = {
@@ -1000,28 +1160,110 @@ fn confirm_pending_action(
             .take()
             .ok_or_else(|| "There is no pending action to confirm.".to_string())?;
         if pending.created_at.elapsed() > CONFIRMATION_TTL {
+            record_audit(
+                &app,
+                &pending.audit,
+                "confirmation_expired",
+                "expired",
+                "The confirmation expired before execution.",
+                None,
+            )?;
             return Err(
                 "The confirmation expired after 60 seconds. Submit the request again.".to_string(),
             );
         }
         pending
     };
-    execute_toggle(&pending.setting)
+    record_audit(
+        &app,
+        &pending.audit,
+        "confirmation_accepted",
+        "pending_execution",
+        "User confirmed the previewed setting change.",
+        None,
+    )?;
+    match execute_toggle(&pending.setting) {
+        Ok(mut execution) => {
+            let result = serde_json::to_value(&execution)
+                .map_err(|_| "Could not serialize the tool result.".to_string())?;
+            if let Err(error) = record_audit(
+                &app,
+                &pending.audit,
+                "tool_completed",
+                "success",
+                &execution.summary,
+                Some(&result),
+            ) {
+                execution.summary = format!("{} Audit warning: {}", execution.summary, error);
+            }
+            Ok(execution)
+        }
+        Err(error) => {
+            record_audit(
+                &app,
+                &pending.audit,
+                "tool_completed",
+                "failed",
+                &error,
+                None,
+            )?;
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 fn cancel_pending_action(
+    app: AppHandle,
     pending_confirmation: State<'_, PendingConfirmation>,
 ) -> Result<String, String> {
     let mut current = pending_confirmation
         .0
         .lock()
         .map_err(|_| "The confirmation gate is unavailable.".to_string())?;
-    if current.take().is_some() {
+    if let Some(pending) = current.take() {
+        record_audit(
+            &app,
+            &pending.audit,
+            "confirmation_cancelled",
+            "cancelled",
+            "User cancelled the previewed setting change.",
+            None,
+        )?;
         Ok("Pending setting change cancelled. Nothing was changed.".to_string())
     } else {
         Ok("There was no pending setting change.".to_string())
     }
+}
+
+#[tauri::command]
+fn get_audit_history(app: AppHandle, limit: Option<u32>) -> Result<Vec<AuditEntry>, String> {
+    let connection = open_audit_database(&app)?;
+    let limit = i64::from(limit.unwrap_or(20).clamp(1, 100));
+    let mut statement = connection
+        .prepare(
+            "SELECT id, timestamp, event_type, action, risk_tier, params_json, outcome, summary, result_json
+             FROM audit_events ORDER BY id DESC LIMIT ?1",
+        )
+        .map_err(|_| "Could not read the local audit history.".to_string())?;
+    let events = statement
+        .query_map(params![limit], |row| {
+            Ok(AuditEntry {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                event_type: row.get(2)?,
+                action: row.get(3)?,
+                risk_tier: row.get(4)?,
+                params_json: row.get(5)?,
+                outcome: row.get(6)?,
+                summary: row.get(7)?,
+                result_json: row.get(8)?,
+            })
+        })
+        .map_err(|_| "Could not read the local audit history.".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read the local audit history.".to_string())?;
+    Ok(events)
 }
 
 fn main() {
@@ -1032,7 +1274,8 @@ fn main() {
             parse_intent,
             process_request,
             confirm_pending_action,
-            cancel_pending_action
+            cancel_pending_action,
+            get_audit_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");
@@ -1139,6 +1382,32 @@ mod tests {
         assert!(matches!(intent.risk_tier, RiskTier::Medium));
         assert_eq!(intent.params.setting_name.as_deref(), Some("dark_mode"));
         assert_eq!(intent.params.value, Some(json!(true)));
+    }
+
+    #[test]
+    fn audit_database_records_events() {
+        let connection = Connection::open_in_memory().expect("in-memory database should open");
+        initialize_audit_database(&connection).expect("audit schema should initialize");
+        connection
+            .execute(
+                "INSERT INTO audit_events (timestamp, event_type, action, risk_tier, params_json, outcome, summary, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    "2026-07-31T00:00:00Z",
+                    "tool_completed",
+                    "get_system_info",
+                    "low",
+                    "{}",
+                    "success",
+                    "Read system information.",
+                    Option::<String>::None,
+                ],
+            )
+            .expect("audit event should insert");
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))
+            .expect("audit count should be readable");
+        assert_eq!(count, 1);
     }
 
     #[test]

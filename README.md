@@ -66,6 +66,10 @@ Current Linux adapters:
 - GNOME dark mode through `gsettings`
 - GNOME Do Not Disturb through `gsettings`
 
+## Local audit history (Step 5)
+
+Every parsed request is recorded in a local SQLite database: clarifications, rejections, confirmation previews, cancellations, expirations, tool starts, successes, and failures. Each event stores the validated action, risk tier, parameters, outcome, summary, and (where applicable) tool result. The database remains on the device in the app's OS data directory as `audit.sqlite3`; the app does not upload it. The backend exposes a bounded `get_audit_history` command for the future history UI.
+
 ## Verification
 
 Run the frontend check locally:
