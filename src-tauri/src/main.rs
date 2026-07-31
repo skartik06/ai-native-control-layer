@@ -799,10 +799,18 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
 }
 
 #[tauri::command]
-async fn chat_with_assistant(app: AppHandle, message: String) -> Result<String, String> {
+async fn chat_with_assistant(
+    app: AppHandle,
+    request_cancellation: State<'_, RequestCancellation>,
+    message: String,
+) -> Result<String, String> {
     let message = message.trim();
     if message.is_empty() || message.len() > 4_000 {
         return Err("Enter a message under 4,000 characters.".to_string());
+    }
+    if let Some(reply) = local_chat_reply(message) {
+        append_debug_log(&app, message, &reply);
+        return Ok(reply);
     }
     let timeout = ollama_timeout();
     let client = Client::builder()
@@ -820,12 +828,27 @@ async fn chat_with_assistant(app: AppHandle, message: String) -> Result<String, 
             {"role": "user", "content": message}
         ]
     });
-    let response = client
-        .post(OLLAMA_API_URL)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| {
+    let (sender, mut receiver) = oneshot::channel();
+    {
+        let mut current = request_cancellation
+            .0
+            .lock()
+            .map_err(|_| "The request control is unavailable.".to_string())?;
+        *current = Some(sender);
+    }
+    let response_result = tokio::select! {
+        result = client.post(OLLAMA_API_URL).json(&body).send() => result,
+        _ = &mut receiver => {
+            request_cancellation.0.lock().ok().and_then(|mut current| current.take());
+            return Err("Chat request cancelled. No system action was taken.".to_string());
+        }
+    };
+    request_cancellation
+        .0
+        .lock()
+        .map_err(|_| "The request control is unavailable.".to_string())?
+        .take();
+    let response = response_result.map_err(|error| {
             if error.is_timeout() {
                 "The local chat model is still thinking. On a VM this can be slow; use a direct Linux GPU install for fast conversational replies.".to_string()
             } else {
@@ -842,6 +865,22 @@ async fn chat_with_assistant(app: AppHandle, message: String) -> Result<String, 
     let reply = final_model_output(&api_response.message.content).to_string();
     append_debug_log(&app, message, &reply);
     Ok(reply)
+}
+
+fn local_chat_reply(message: &str) -> Option<String> {
+    let normalized = message
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| character.is_alphanumeric() || character.is_whitespace())
+        .collect::<String>();
+    let text = normalized.trim();
+    match text {
+        "hi" | "hello" | "hey" | "good morning" | "good afternoon" | "good evening" => Some("Hi! I'm your local Linux assistant. In Control mode I can inspect your system, open supported apps, change approved settings, and control media with confirmation. In Chat mode I can answer general questions using your local model.".to_string()),
+        "thanks" | "thank you" | "thx" => Some("You're welcome. Switch to Control mode whenever you want me to do something on your Linux desktop.".to_string()),
+        "help" | "what can you do" | "what can u do" | "who are you" => Some("I'm a privacy-first Linux assistant. Try Control mode for: show system information, show Wi-Fi status, find files, open Firefox, turn on dark mode, pause music, or next song. App, setting, and media changes always need your confirmation.".to_string()),
+        _ => None,
+    }
 }
 
 const MAX_RESULTS: usize = 50;
@@ -2053,6 +2092,14 @@ mod tests {
         assert!(intent
             .clarification_question
             .is_some_and(|message| message.contains("safely check")));
+    }
+
+    #[test]
+    fn chat_mode_handles_common_small_talk_without_ollama() {
+        assert!(local_chat_reply("hi").is_some());
+        assert!(local_chat_reply("thank you").is_some());
+        assert!(local_chat_reply("what can you do?").is_some());
+        assert!(local_chat_reply("explain the Linux kernel").is_none());
     }
 
     #[test]

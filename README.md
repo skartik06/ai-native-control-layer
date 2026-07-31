@@ -35,7 +35,7 @@ pnpm tauri dev
 
 If `OLLAMA_MODEL` is not set, the app now detects installed Ollama models and prefers Qwen3 (including `qwen3:1.7b` for small CPU-only VMs). Set `OLLAMA_MODEL` only when you want to force a particular installed model.
 
-The intent request disables Qwen3 thinking and limits its context/output to the small size required for structured JSON. This avoids wasting CPU and RAM in virtual machines. The local response timeout is 180 seconds by default; to allow up to ten minutes for a request:
+The intent request disables Qwen3 thinking and limits its context/output to the small size required for structured JSON. This avoids wasting CPU and RAM in virtual machines. Chat mode is intentionally separate from Control mode: it never executes an action, and common greetings, help, and thanks respond instantly without calling Ollama. The Stop button cancels either a Control or Chat request that is waiting on Ollama. The local response timeout is 180 seconds by default; to allow up to ten minutes for a request:
 
 ```bash
 OLLAMA_TIMEOUT_SECONDS=600 OLLAMA_MODEL=qwen3:4b pnpm tauri dev
