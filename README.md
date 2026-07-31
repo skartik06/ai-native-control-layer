@@ -79,3 +79,13 @@ pnpm build
 ```
 
 Each push to `main` also runs a Linux compilation check in GitHub Actions.
+
+## Linux release packages (Step 7)
+
+The **Package Linux desktop app** GitHub Actions workflow produces a Debian package (`.deb`) and portable AppImage. Run it manually from the repository's **Actions** tab, or create and push a version tag such as `v0.1.0`. Download the `ai-native-control-layer-linux` artifact from the completed run. On Debian/Kali/Ubuntu, install the downloaded Debian package with:
+
+```bash
+sudo apt install ./ai-native-control-layer_0.1.0_amd64.deb
+```
+
+The packaged app still needs a local Ollama service and selected model; for a CPU-only VM, start it with `OLLAMA_MODEL=qwen3:1.7b ai-native-control-layer`.
