@@ -724,6 +724,13 @@ fn scoped_directory(path: Option<&str>) -> Result<PathBuf, String> {
     let root = user_root()?;
     let candidate = match path {
         Some(value) if !value.trim().is_empty() => {
+            let normalized = value.trim().to_lowercase();
+            if matches!(
+                normalized.as_str(),
+                "home" | "home folder" | "my home" | "my home folder"
+            ) {
+                return Ok(root);
+            }
             let supplied = PathBuf::from(value.trim());
             if supplied.is_absolute() {
                 supplied
@@ -1554,6 +1561,15 @@ mod tests {
             .as_str()
             .is_some_and(|path| path.ends_with("keep.txt")));
         fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn home_folder_alias_resolves_to_the_user_root() {
+        assert_eq!(
+            scoped_directory(Some("my home folder")).unwrap(),
+            user_root().unwrap()
+        );
     }
 
     #[test]
