@@ -221,6 +221,42 @@ fn small_talk_request(request: &str) -> Option<Intent> {
     }
 }
 
+fn local_large_file_request(request: &str) -> Option<Intent> {
+    let normalized = request.to_lowercase();
+    if !(normalized.contains("file")
+        && (normalized.contains("large") || normalized.contains("bigger")))
+    {
+        return None;
+    }
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    let threshold_mb = words.iter().enumerate().find_map(|(index, word)| {
+        word.strip_suffix("mb")
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| {
+                (words.get(index + 1) == Some(&"mb"))
+                    .then(|| word.parse::<u64>().ok())
+                    .flatten()
+            })
+    })?;
+    let directory = if normalized.contains("home") {
+        "home"
+    } else {
+        "Documents"
+    };
+    Some(Intent {
+        action: Action::ListLargeFiles,
+        params: IntentParams {
+            directory: Some(directory.to_string()),
+            threshold_mb: Some(threshold_mb),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Low,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
 fn local_toggle_request(request: &str) -> Option<Intent> {
     let request = request.to_lowercase();
     let setting_name = if request.contains("dark mode") || request.contains("light mode") {
@@ -490,6 +526,14 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
             "Locally handled a greeting without calling Ollama.",
         );
         return Ok(clarification);
+    }
+    if let Some(intent) = local_large_file_request(request) {
+        append_debug_log(
+            &app,
+            request,
+            "Locally parsed a large-file request before Ollama.",
+        );
+        return Ok(intent);
     }
     if let Some(intent) = local_toggle_request(request) {
         append_debug_log(
@@ -1496,6 +1540,15 @@ mod tests {
             .expect("light mode should be parsed locally");
         assert_eq!(intent.params.setting_name.as_deref(), Some("dark_mode"));
         assert_eq!(intent.params.value, Some(json!(false)));
+    }
+
+    #[test]
+    fn large_file_requests_are_parsed_without_ollama() {
+        let intent = local_large_file_request("show files larger than 100 MB in my home folder")
+            .expect("large-file request should be parsed locally");
+        assert!(matches!(intent.action, Action::ListLargeFiles));
+        assert_eq!(intent.params.directory.as_deref(), Some("home"));
+        assert_eq!(intent.params.threshold_mb, Some(100));
     }
 
     #[test]
