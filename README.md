@@ -91,3 +91,16 @@ sudo apt install ./ai-native-control-layer_0.1.0_amd64.deb
 ```
 
 The packaged app still needs a local Ollama service and selected model; for a CPU-only VM, start it with `OLLAMA_MODEL=qwen3:1.7b ai-native-control-layer`.
+
+## Start with the desktop session
+
+After installing the Debian package, enable the user-level assistant service once:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp /usr/share/doc/ai-native-control-layer/ai-native-control-layer.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ai-native-control-layer.service
+```
+
+The service starts the overlay when the user signs in and restarts it if it crashes. Disable it at any time with `systemctl --user disable --now ai-native-control-layer.service`.

@@ -1,0 +1,13 @@
+[Unit]
+Description=Linux Assistant desktop overlay
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ai-native-control-layer
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
