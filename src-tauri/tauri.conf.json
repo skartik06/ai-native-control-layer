@@ -14,9 +14,9 @@
       {
         "label": "main",
         "title": "AI Native Control Layer",
-        "width": 760,
-        "height": 280,
-        "resizable": false,
+        "width": 860,
+        "height": 620,
+        "resizable": true,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

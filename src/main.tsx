@@ -158,10 +158,16 @@ function App() {
 
   return <main className="overlay-shell">
     <section className="command-palette" aria-label="AI Native Control Layer">
-      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>CONTROL LAYER</span><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button>{loading && <button className="stop-button" type="button" onClick={stopCurrentRequest}>Stop</button>}<kbd>Ctrl Space</kbd></div>
+      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>LINUX ASSISTANT</span><span className="profile-badge">FULL DESKTOP · ALPHA</span><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button>{loading && <button className="stop-button" type="button" onClick={stopCurrentRequest}>Stop</button>}<kbd>Ctrl Space</kbd></div>
+      <section className="assistant-intro">
+        <p className="eyebrow">PRIVATE · LOCAL-FIRST · SAFETY-GATED</p>
+        <h1>What can I help you do?</h1>
+        <p>Control your Linux desktop, inspect your system, and safely launch supported apps. Voice and opt-in personal memory are next.</p>
+        <div className="capability-row"><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span><span>Audit trail</span></div>
+      </section>
       <form onSubmit={submit}>
         <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
-          placeholder="Ask your computer anything..." aria-label="Command input" />
+          placeholder="Try: open file manager, show Wi-Fi status, or turn on dark mode" aria-label="Command input" />
       </form>
       {confirmation && <section className="confirmation" aria-label="Confirm setting change">
         <p>Preview: {confirmation.summary}</p>
@@ -179,7 +185,7 @@ function App() {
           <p>{entry.summary}</p><time>{new Date(entry.timestamp).toLocaleString()}</time>
         </li>)}</ul>}
       </section>}
-      <p className="hint">{loading ? "Working..." : confirmation ? "Nothing changes until you confirm." : "Linux MVP · read-only tools run automatically; changes require confirmation."}</p>
+      <p className="hint">{loading ? "Working — use Stop to cancel a waiting Ollama request." : confirmation ? "Nothing changes until you confirm." : "Read-only checks run automatically. App launches and settings need confirmation."}</p>
     </section>
   </main>;
 }
