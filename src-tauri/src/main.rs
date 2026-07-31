@@ -1006,6 +1006,90 @@ struct RuntimeProfile {
 }
 
 #[derive(Serialize)]
+struct VoiceStatus {
+    text_to_speech_available: bool,
+    speech_to_text_available: bool,
+    text_to_speech_engine: Option<String>,
+    speech_to_text_engine: Option<String>,
+    summary: String,
+}
+
+#[cfg(target_os = "linux")]
+fn executable_available(program: &str) -> bool {
+    Command::new("which")
+        .arg(program)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn executable_available(_: &str) -> bool {
+    false
+}
+
+#[tauri::command]
+fn get_voice_status() -> VoiceStatus {
+    let text_to_speech_engine = if executable_available("spd-say") {
+        Some("spd-say".to_string())
+    } else if executable_available("espeak-ng") {
+        Some("espeak-ng".to_string())
+    } else {
+        None
+    };
+    let speech_to_text_engine = if executable_available("whisper-cli") {
+        Some("whisper-cli".to_string())
+    } else if executable_available("whisper-cpp") {
+        Some("whisper-cpp".to_string())
+    } else {
+        None
+    };
+    let summary = match (&text_to_speech_engine, &speech_to_text_engine) {
+        (Some(tts), Some(stt)) => format!("Voice output ({tts}) and local speech recognition ({stt}) are available."),
+        (Some(tts), None) => format!("Voice output is available through {tts}. Install whisper.cpp to enable local voice input."),
+        (None, _) => "Voice output is not installed. Install speech-dispatcher or espeak-ng on Linux.".to_string(),
+    };
+    VoiceStatus {
+        text_to_speech_available: text_to_speech_engine.is_some(),
+        speech_to_text_available: speech_to_text_engine.is_some(),
+        text_to_speech_engine,
+        speech_to_text_engine,
+        summary,
+    }
+}
+
+#[tauri::command]
+fn speak_text(text: String) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("There is no response to speak.".to_string());
+    }
+    let clipped = text.chars().take(1_000).collect::<String>();
+    #[cfg(target_os = "linux")]
+    {
+        let program = if executable_available("spd-say") {
+            "spd-say"
+        } else if executable_available("espeak-ng") {
+            "espeak-ng"
+        } else {
+            return Err(
+                "Voice output is not installed. Install speech-dispatcher or espeak-ng first."
+                    .to_string(),
+            );
+        };
+        Command::new(program)
+            .arg(&clipped)
+            .spawn()
+            .map_err(|_| "Could not start the Linux speech engine.".to_string())?;
+        return Ok("Speaking the latest assistant response.".to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = clipped;
+        Err("Voice output is available in the Linux desktop build only.".to_string())
+    }
+}
+
+#[derive(Serialize)]
 struct MemoryEntry {
     id: i64,
     created_at: String,
@@ -1983,6 +2067,8 @@ fn main() {
             cancel_pending_action,
             get_audit_history,
             get_runtime_profile,
+            get_voice_status,
+            speak_text,
             remember_preference,
             get_memory,
             forget_memory,

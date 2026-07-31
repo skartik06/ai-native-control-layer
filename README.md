@@ -8,6 +8,8 @@ Install a current Rust toolchain, Node.js 20+, Ollama, and your distro's Tauri/W
 
 For the optional settings adapters, install `brightnessctl` for brightness control and `playerctl` for media playback controls. Dark mode and Do Not Disturb currently use GNOME's `gsettings` schemas; unsupported desktops return an error instead of guessing.
 
+For spoken output, install either `speech-dispatcher` (recommended; provides `spd-say`) or `espeak-ng`. The assistant detects these locally and enables **Speak response** only when one is present. Voice recognition is prepared as an optional local `whisper.cpp` integration and is intentionally not silently downloaded or sent to a cloud service.
+
 ## Run
 
 ```bash

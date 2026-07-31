@@ -51,6 +51,12 @@ type MemoryEntry = {
   value: string;
 };
 
+type VoiceStatus = {
+  text_to_speech_available: boolean;
+  speech_to_text_available: boolean;
+  summary: string;
+};
+
 function readableError(error: unknown) {
   return String(error).replace(/^Error:\s*/, "");
 }
@@ -67,6 +73,7 @@ function App() {
   const [memoryKey, setMemoryKey] = useState("");
   const [memoryValue, setMemoryValue] = useState("");
   const [mode, setMode] = useState<"control" | "chat">("control");
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -92,6 +99,14 @@ function App() {
       .then(({ invoke }) => invoke<RuntimeProfile>("get_runtime_profile"))
       .then(setRuntimeProfile)
       .catch(() => setRuntimeProfile(null));
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke<VoiceStatus>("get_voice_status"))
+      .then(setVoiceStatus)
+      .catch(() => setVoiceStatus(null));
   }, []);
 
   useEffect(() => {
@@ -140,6 +155,17 @@ function App() {
       setResponse(await invoke<string>("stop_request"));
     } catch (error) {
       setResponse(`Could not stop the request. ${readableError(error)}`);
+    }
+  }
+
+  async function speakLatestResponse() {
+    if (!isTauri || !response) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const status = await invoke<string>("speak_text", { text: response });
+      setResponse((current) => `${current}\n\n${status}`);
+    } catch (error) {
+      setResponse((current) => `${current}\n\nVoice output unavailable: ${readableError(error)}`);
     }
   }
 
@@ -229,9 +255,9 @@ function App() {
       <section className="assistant-intro">
         <p className="eyebrow">PRIVATE · LOCAL-FIRST · SAFETY-GATED</p>
         <h1>What can I help you do?</h1>
-        <p>Control your Linux desktop, inspect your system, and safely launch supported apps. Voice and opt-in personal memory are next.</p>
+        <p>Control your Linux desktop, inspect your system, and safely launch supported apps. Your latest response can be spoken when a Linux speech engine is installed.</p>
         {runtimeProfile && <p className="runtime-summary">{runtimeProfile.summary} Detected: {runtimeProfile.total_memory_gb} GB RAM · {runtimeProfile.cpu_cores} CPU cores.</p>}
-        <div className="capability-row"><button className={mode === "control" ? "mode-active" : ""} type="button" onClick={() => setMode("control")}>Control mode</button><button className={mode === "chat" ? "mode-active" : ""} type="button" onClick={() => setMode("chat")}>Chat mode</button><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span></div>
+        <div className="capability-row"><button className={mode === "control" ? "mode-active" : ""} type="button" onClick={() => setMode("control")}>Control mode</button><button className={mode === "chat" ? "mode-active" : ""} type="button" onClick={() => setMode("chat")}>Chat mode</button><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span><span title={voiceStatus?.summary}>{voiceStatus?.text_to_speech_available ? "Voice output ready" : "Voice output setup needed"}</span></div>
       </section>
       <form onSubmit={submit}>
         <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
@@ -245,7 +271,7 @@ function App() {
           <button type="button" className="confirm" onClick={confirm} disabled={loading}>Confirm change</button>
         </div>
       </section>}
-      {response && <pre className="response" role="status">{response}</pre>}
+      {response && <><div className="response-tools"><button type="button" onClick={speakLatestResponse} disabled={!voiceStatus?.text_to_speech_available}>Speak response</button></div><pre className="response" role="status">{response}</pre></>}
       {history && <section className="audit-history" aria-label="Local audit history">
         <div className="audit-heading"><strong>Local audit history</strong><span>Latest {history.length} events</span></div>
         {history.length === 0 ? <p className="empty-history">No events recorded yet.</p> : <ul>{history.map((entry) => <li key={entry.id}>
