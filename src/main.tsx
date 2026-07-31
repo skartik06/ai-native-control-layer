@@ -249,7 +249,7 @@ function App() {
       {history && <section className="audit-history" aria-label="Local audit history">
         <div className="audit-heading"><strong>Local audit history</strong><span>Latest {history.length} events</span></div>
         {history.length === 0 ? <p className="empty-history">No events recorded yet.</p> : <ul>{history.map((entry) => <li key={entry.id}>
-          <div><span className={`outcome outcome-${entry.outcome}`}>{entry.outcome.replaceAll("_", " ")}</span><code>{entry.action}</code></div>
+          <div><span className={`outcome outcome-${entry.outcome}`}>{entry.outcome.replace(/_/g, " ")}</span><code>{entry.action}</code></div>
           <p>{entry.summary}</p><time>{new Date(entry.timestamp).toLocaleString()}</time>
         </li>)}</ul>}
       </section>}

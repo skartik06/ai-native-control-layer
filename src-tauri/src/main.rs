@@ -32,6 +32,7 @@ enum Action {
     ToggleSetting,
     ReadRecentLogs,
     LaunchApp,
+    MediaControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -65,6 +66,7 @@ struct IntentParams {
     service_name: Option<String>,
     lines: Option<u32>,
     app_name: Option<String>,
+    media_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -124,11 +126,11 @@ struct OllamaModel {
 fn system_prompt() -> &'static str {
     r#"You are the intent parser for a safety-first Linux desktop assistant. Return ONLY one JSON object, with no Markdown or explanation. It must have action, params, risk_tier, confidence, clarification_needed, and clarification_question keys.
 
-Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs. Any request to open or launch an application (including File Explorer), change an unlisted setting, delete files, install software, or perform an unsupported action MUST set clarification_needed to true. Use action "search_files", params {}, risk_tier "low", confidence below 0.9, and ask the user what supported task they want instead.
+Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs, media_control. Any request to open or launch an application, change an unlisted setting, delete files, install software, or perform an unsupported action MUST set clarification_needed to true. Use action "search_files", params {}, risk_tier "low", confidence below 0.9, and ask the user what supported task they want instead.
 
-Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines.
+Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines. media_control requires media_command (play, pause, next, or previous).
 
-Use low risk only for read-only actions; medium only for toggle_setting. Params may use only query, filters, directory, threshold_mb, setting_name, value, service_name, lines. filters may use type, date_range, size_min, size_max, path. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
+Use low risk only for read-only actions; medium only for toggle_setting and media_control. Params may use only query, filters, directory, threshold_mb, setting_name, value, service_name, lines, media_command. filters may use type, date_range, size_min, size_max, path. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
 }
 
 fn append_debug_log(app: &AppHandle, user_input: &str, model_output: &str) {
@@ -338,6 +340,44 @@ fn local_toggle_request(request: &str) -> Option<Intent> {
     })
 }
 
+fn local_media_request(request: &str) -> Option<Intent> {
+    let normalized = request.to_lowercase();
+    let media_command = if ["pause", "stop music", "stop song"]
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        "pause"
+    } else if ["next song", "next track", "skip song", "skip track"]
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        "next"
+    } else if ["previous song", "previous track", "back song", "back track"]
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        "previous"
+    } else if ["play music", "play song", "resume music", "resume song"]
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        "play"
+    } else {
+        return None;
+    };
+    Some(Intent {
+        action: Action::MediaControl,
+        params: IntentParams {
+            media_command: Some(media_command.to_string()),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
 fn select_available_model(models: &[OllamaModel]) -> Option<String> {
     ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
         .iter()
@@ -392,6 +432,18 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
     }
 
     let params = &intent.params;
+    if params.app_name.is_some() && !matches!(intent.action, Action::LaunchApp) {
+        return Err(
+            "Ollama returned an app parameter for an incompatible action. No action was taken."
+                .to_string(),
+        );
+    }
+    if params.media_command.is_some() && !matches!(intent.action, Action::MediaControl) {
+        return Err(
+            "Ollama returned a media parameter for an incompatible action. No action was taken."
+                .to_string(),
+        );
+    }
     match intent.action {
         Action::SearchFiles
             if (params.query.is_none() && params.filters.is_none())
@@ -465,13 +517,27 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
         {
             Err("App launch requires one supported app name. No action was taken.".to_string())
         }
+        Action::MediaControl
+            if params.media_command.is_none()
+                || params.query.is_some()
+                || params.filters.is_some()
+                || params.directory.is_some()
+                || params.threshold_mb.is_some()
+                || params.setting_name.is_some()
+                || params.value.is_some()
+                || params.service_name.is_some()
+                || params.lines.is_some()
+                || params.app_name.is_some() =>
+        {
+            Err("Media control requires one supported media command. No action was taken.".to_string())
+        }
         _ => Ok(()),
     }
 }
 
 fn planned_risk(action: Action) -> RiskTier {
     match action {
-        Action::ToggleSetting | Action::LaunchApp => RiskTier::Medium,
+        Action::ToggleSetting | Action::LaunchApp | Action::MediaControl => RiskTier::Medium,
         Action::SearchFiles
         | Action::GetSystemInfo
         | Action::ListLargeFiles
@@ -491,6 +557,9 @@ fn plan_intent(intent: &Intent) -> Result<RiskTier, String> {
     }
     if matches!(intent.action, Action::LaunchApp) {
         prepare_launch(&intent.params)?;
+    }
+    if matches!(intent.action, Action::MediaControl) {
+        prepare_media(&intent.params)?;
     }
     Ok(expected_risk)
 }
@@ -579,6 +648,25 @@ fn launch_preview(target: &LaunchTarget) -> String {
     }
 }
 
+fn prepare_media(params: &IntentParams) -> Result<MediaCommand, String> {
+    match params.media_command.as_deref().map(str::trim) {
+        Some("play") => Ok(MediaCommand::Play),
+        Some("pause") => Ok(MediaCommand::Pause),
+        Some("next") => Ok(MediaCommand::Next),
+        Some("previous") => Ok(MediaCommand::Previous),
+        _ => Err("Only play, pause, next, and previous are supported media commands. No action was taken.".to_string()),
+    }
+}
+
+fn media_preview(command: &MediaCommand) -> String {
+    match command {
+        MediaCommand::Play => "Resume the current media player.".to_string(),
+        MediaCommand::Pause => "Pause the current media player.".to_string(),
+        MediaCommand::Next => "Skip to the next media track.".to_string(),
+        MediaCommand::Previous => "Go to the previous media track.".to_string(),
+    }
+}
+
 async fn parse_intent_internal(
     app: AppHandle,
     request: String,
@@ -628,6 +716,14 @@ async fn parse_intent_internal(
             &app,
             request,
             "Locally parsed whitelisted setting request before Ollama.",
+        );
+        return Ok(intent);
+    }
+    if let Some(intent) = local_media_request(request) {
+        append_debug_log(
+            &app,
+            request,
+            "Locally parsed a media request before Ollama.",
         );
         return Ok(intent);
     }
@@ -788,9 +884,18 @@ enum LaunchTarget {
 }
 
 #[derive(Clone)]
+enum MediaCommand {
+    Play,
+    Pause,
+    Next,
+    Previous,
+}
+
+#[derive(Clone)]
 enum PendingOperation {
     Toggle(ToggleSetting),
     Launch(LaunchTarget),
+    Media(MediaCommand),
 }
 
 struct PendingAction {
@@ -1388,6 +1493,33 @@ fn execute_launch(_: &LaunchTarget) -> Result<ToolExecution, String> {
     Err("App launching is available in the Linux desktop MVP only.".to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn execute_media(command: &MediaCommand) -> Result<ToolExecution, String> {
+    let action = match command {
+        MediaCommand::Play => "play",
+        MediaCommand::Pause => "pause",
+        MediaCommand::Next => "next",
+        MediaCommand::Previous => "previous",
+    };
+    let output = Command::new("playerctl").arg(action).output().map_err(|_| {
+        "Could not run playerctl. Install it with your distro package manager and start a supported media player."
+            .to_string()
+    })?;
+    if !output.status.success() {
+        return Err("No compatible media player is currently available for playerctl.".to_string());
+    }
+    Ok(ToolExecution {
+        tool: "media_control".to_string(),
+        summary: format!("Applied: {}", media_preview(command)),
+        data: json!({"applied": true, "command": action}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_media(_: &MediaCommand) -> Result<ToolExecution, String> {
+    Err("Media control is available in the Linux desktop MVP only.".to_string())
+}
+
 fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
     match intent.action {
         Action::SearchFiles => search_files(&intent.params),
@@ -1400,6 +1532,9 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
         }
         Action::LaunchApp => {
             Err("App launching must pass through the confirmation gate.".to_string())
+        }
+        Action::MediaControl => {
+            Err("Media changes must pass through the confirmation gate.".to_string())
         }
     }
 }
@@ -1506,6 +1641,13 @@ async fn process_request(
                         launch_preview(&target),
                     )
                 }
+                Action::MediaControl => {
+                    let command = prepare_media(&intent.params)?;
+                    (
+                        PendingOperation::Media(command.clone()),
+                        media_preview(&command),
+                    )
+                }
                 _ => {
                     return Err(
                         "Unsupported confirmation operation. No action was taken.".to_string()
@@ -1604,6 +1746,7 @@ fn confirm_pending_action(
     let execution_result = match &pending.operation {
         PendingOperation::Toggle(setting) => execute_toggle(setting),
         PendingOperation::Launch(target) => execute_launch(target),
+        PendingOperation::Media(command) => execute_media(command),
     };
     match execution_result {
         Ok(mut execution) => {
@@ -1920,6 +2063,28 @@ mod tests {
         assert!(matches!(intent.risk_tier, RiskTier::Medium));
         assert_eq!(intent.params.setting_name.as_deref(), Some("dark_mode"));
         assert_eq!(intent.params.value, Some(json!(true)));
+    }
+
+    #[test]
+    fn local_media_requests_bypass_the_model_and_require_confirmation() {
+        let intent = local_media_request("skip to the next song")
+            .expect("next-track request should be parsed locally");
+        assert!(matches!(intent.action, Action::MediaControl));
+        assert!(matches!(plan_intent(&intent), Ok(RiskTier::Medium)));
+        assert_eq!(intent.params.media_command.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn planner_rejects_unrecognised_media_commands() {
+        let result = plan_intent(&intent(
+            Action::MediaControl,
+            IntentParams {
+                media_command: Some("volume_up".to_string()),
+                ..Default::default()
+            },
+            RiskTier::Medium,
+        ));
+        assert!(result.is_err());
     }
 
     #[test]

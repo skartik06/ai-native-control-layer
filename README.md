@@ -6,7 +6,7 @@ Linux-first Tauri desktop overlay with a `Ctrl+Space` global toggle, local Ollam
 
 Install a current Rust toolchain, Node.js 20+, Ollama, and your distro's Tauri/WebKit and NetworkManager dependencies. On Debian/Ubuntu, see the [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
 
-For the optional settings adapters, install `brightnessctl` for brightness control. Dark mode and Do Not Disturb currently use GNOME's `gsettings` schemas; unsupported desktops return an error instead of guessing.
+For the optional settings adapters, install `brightnessctl` for brightness control and `playerctl` for media playback controls. Dark mode and Do Not Disturb currently use GNOME's `gsettings` schemas; unsupported desktops return an error instead of guessing.
 
 ## Run
 
@@ -53,11 +53,11 @@ Read-only tools that can run automatically on Linux are:
 - NetworkManager Wi-Fi status through `nmcli`
 - recent systemd service logs through `journalctl`
 
-Settings changes, app launching, file deletion, package installation, and all other high-risk operations are not implemented. No low-risk tool accepts or executes a shell string from the model.
+Settings changes, whitelisted application launches, and media playback changes require confirmation. File deletion, package installation, and all other high-risk operations are not implemented. No low-risk tool accepts or executes a shell string from the model.
 
 ## Setting confirmation gate
 
-The only medium-risk operation is a whitelisted `toggle_setting`. The backend validates both the setting and value before it shows a preview. A confirmation is kept only in backend memory, expires after 60 seconds, and is discarded on cancel or after one attempt. The frontend cannot modify the setting value after preview.
+Medium-risk operations are whitelisted settings, application launches, and media playback controls. The backend validates every parameter before it shows a preview. A confirmation is kept only in backend memory, expires after 60 seconds, and is discarded on cancel or after one attempt. The frontend cannot modify the planned action after preview.
 
 Simple on/off requests for Wi-Fi, dark mode, and Do Not Disturb are locally parsed before Ollama. This makes the safety preview reliable even when a small local model cannot produce complete JSON. The backend still applies the same whitelist and confirmation rules.
 
@@ -67,6 +67,9 @@ Current Linux adapters:
 - brightness from 0–100% through `brightnessctl`
 - GNOME dark mode through `gsettings`
 - GNOME Do Not Disturb through `gsettings`
+- play, pause, next, and previous track through `playerctl`
+
+Application and media phrases such as `open firefox`, `opn files`, `pause music`, and `next song` are locally parsed before Ollama, then presented for confirmation. This preserves responsiveness even on a low-resource VM.
 
 ## Local audit history (Step 5)
 
