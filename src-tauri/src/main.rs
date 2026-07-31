@@ -1040,7 +1040,7 @@ async fn process_request(
     pending_confirmation: State<'_, PendingConfirmation>,
     request: String,
 ) -> Result<ProcessResponse, String> {
-    let intent = parse_intent(app, request).await?;
+    let intent = parse_intent(app.clone(), request).await?;
     let audit = AuditContext::from(&intent);
     if intent.clarification_needed {
         let message = intent
