@@ -33,7 +33,7 @@ pnpm tauri dev
 
 `qwen3:4b` is a ~2.5 GB download. Optionally set `OLLAMA_MODEL` to another locally downloaded model. The backend writes raw input and model output to its local app-data debug log as required for development; the log is not uploaded anywhere by the app.
 
-The local response timeout is 180 seconds by default because CPU-only virtual machines can be slow. To allow up to ten minutes for a request:
+The intent request disables Qwen3 thinking and limits its context/output to the small size required for structured JSON. This avoids wasting CPU and RAM in virtual machines. The local response timeout is 180 seconds by default; to allow up to ten minutes for a request:
 
 ```bash
 OLLAMA_TIMEOUT_SECONDS=600 OLLAMA_MODEL=qwen3:4b pnpm tauri dev

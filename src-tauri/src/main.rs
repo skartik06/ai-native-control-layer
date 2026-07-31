@@ -365,7 +365,21 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
         return Ok(clarification);
     }
     let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b-instruct".to_string());
-    let body = json!({"model": model, "stream": false, "format": "json", "options": {"temperature": 0}, "messages": [{"role": "system", "content": system_prompt()}, {"role": "user", "content": request}]});
+    let body = json!({
+        "model": model,
+        "stream": false,
+        "format": "json",
+        "think": false,
+        "options": {
+            "temperature": 0,
+            "num_ctx": 2048,
+            "num_predict": 256
+        },
+        "messages": [
+            {"role": "system", "content": system_prompt()},
+            {"role": "user", "content": request}
+        ]
+    });
     let timeout = ollama_timeout();
     let client = Client::builder()
         .timeout(timeout)
