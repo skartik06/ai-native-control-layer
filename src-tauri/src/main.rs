@@ -176,6 +176,42 @@ fn unsupported_app_request(request: &str) -> Option<Intent> {
     }
 }
 
+fn local_toggle_request(request: &str) -> Option<Intent> {
+    let request = request.to_lowercase();
+    let setting_name = if request.contains("dark mode") {
+        "dark_mode"
+    } else if request.contains("do not disturb") || request.contains("dnd") {
+        "do_not_disturb"
+    } else if request.contains("wi-fi") || request.contains("wifi") {
+        "wifi"
+    } else {
+        return None;
+    };
+    let enable = ["turn on", "enable", "switch on"]
+        .iter()
+        .any(|phrase| request.contains(phrase));
+    let disable = ["turn off", "disable", "switch off"]
+        .iter()
+        .any(|phrase| request.contains(phrase));
+    let value = match (enable, disable) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return None,
+    };
+    Some(Intent {
+        action: Action::ToggleSetting,
+        params: IntentParams {
+            setting_name: Some(setting_name.to_string()),
+            value: Some(json!(value)),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
 fn validate_intent(intent: &Intent) -> Result<(), String> {
     if intent.confidence < 0.9 && !intent.clarification_needed {
         return Err(
@@ -363,6 +399,14 @@ async fn parse_intent(app: AppHandle, request: String) -> Result<Intent, String>
             "Locally rejected unsupported app-launch request.",
         );
         return Ok(clarification);
+    }
+    if let Some(intent) = local_toggle_request(request) {
+        append_debug_log(
+            &app,
+            request,
+            "Locally parsed whitelisted setting request before Ollama.",
+        );
+        return Ok(intent);
     }
     let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b-instruct".to_string());
     let body = json!({
@@ -1085,6 +1129,16 @@ mod tests {
     fn app_launch_requests_are_rejected_before_the_model() {
         let result = unsupported_app_request("open the file manager");
         assert!(result.is_some_and(|intent| intent.clarification_needed));
+    }
+
+    #[test]
+    fn local_whitelisted_setting_request_bypasses_the_model() {
+        let intent = local_toggle_request("turn on the dark mode")
+            .expect("dark mode should be parsed locally");
+        assert!(matches!(intent.action, Action::ToggleSetting));
+        assert!(matches!(intent.risk_tier, RiskTier::Medium));
+        assert_eq!(intent.params.setting_name.as_deref(), Some("dark_mode"));
+        assert_eq!(intent.params.value, Some(json!(true)));
     }
 
     #[test]

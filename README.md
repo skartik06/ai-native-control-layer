@@ -57,6 +57,8 @@ Settings changes, app launching, file deletion, package installation, and all ot
 
 The only medium-risk operation is a whitelisted `toggle_setting`. The backend validates both the setting and value before it shows a preview. A confirmation is kept only in backend memory, expires after 60 seconds, and is discarded on cancel or after one attempt. The frontend cannot modify the setting value after preview.
 
+Simple on/off requests for Wi-Fi, dark mode, and Do Not Disturb are locally parsed before Ollama. This makes the safety preview reliable even when a small local model cannot produce complete JSON. The backend still applies the same whitelist and confirmation rules.
+
 Current Linux adapters:
 
 - Wi-Fi on/off through NetworkManager `nmcli`
