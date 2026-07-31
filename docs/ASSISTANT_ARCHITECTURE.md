@@ -50,12 +50,12 @@ Audit history remains local and records actions, confirmations, failures, and ca
 - Launching apps and changing settings require a preview and explicit confirmation.
 - Commands never execute a shell string supplied by the model.
 - Unsupported requests receive a clear explanation and a safe alternative.
-- Voice uses the same planner and confirmation gate as text.
+- Future voice input will use the same planner and confirmation gate as text. Current text-to-speech only speaks an already displayed response and never triggers an action.
 
 ## Delivery milestones
 
 1. Assistant shell, runtime profile detection, local history and status.
-2. Push-to-talk transcription and spoken replies.
+2. Push-to-talk transcription and spoken replies (spoken replies are now available through installed Linux speech engines; transcription remains pending).
 3. Capability plugins: app/window control, files, settings, notifications, media, and system health.
 4. Opt-in memory with review/delete controls.
 5. Full Linux packaging and release.
