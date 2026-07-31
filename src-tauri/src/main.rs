@@ -130,7 +130,7 @@ fn system_prompt() -> &'static str {
 
 Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs, media_control, send_notification. Any request to open or launch an application, change an unlisted setting, delete files, install software, or perform an unsupported action MUST set clarification_needed to true. Use action "search_files", params {}, risk_tier "low", confidence below 0.9, and ask the user what supported task they want instead.
 
-Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines. media_control requires media_command (play, pause, next, or previous). send_notification requires notification_body.
+Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, volume, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines. media_control requires media_command (play, pause, next, or previous). send_notification requires notification_body.
 
 Use low risk only for read-only actions; medium only for toggle_setting, media_control, and send_notification. Params may use only query, filters, directory, threshold_mb, setting_name, value, service_name, lines, media_command, notification_body. filters may use type, date_range, size_min, size_max, path. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
 }
@@ -305,6 +305,26 @@ fn local_large_file_request(request: &str) -> Option<Intent> {
 
 fn local_toggle_request(request: &str) -> Option<Intent> {
     let request = request.to_lowercase();
+    if request.contains("volume") {
+        let percent = request.split_whitespace().find_map(|word| {
+            word.trim_end_matches('%')
+                .parse::<u8>()
+                .ok()
+                .filter(|value| *value <= 100)
+        })?;
+        return Some(Intent {
+            action: Action::ToggleSetting,
+            params: IntentParams {
+                setting_name: Some("volume".to_string()),
+                value: Some(json!(percent)),
+                ..Default::default()
+            },
+            risk_tier: RiskTier::Medium,
+            confidence: 1.0,
+            clarification_needed: false,
+            clarification_question: None,
+        });
+    }
     let setting_name = if request.contains("dark mode") || request.contains("light mode") {
         "dark_mode"
     } else if request.contains("do not disturb") || request.contains("dnd") {
@@ -649,6 +669,16 @@ fn prepare_toggle(params: &IntentParams) -> Result<ToggleSetting, String> {
                 })?;
             Ok(ToggleSetting::Brightness { percent })
         }
+        "volume" => {
+            let percent = value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|value| *value <= 100)
+                .ok_or_else(|| {
+                    "Volume must be a whole number from 0 to 100. No action was taken.".to_string()
+                })?;
+            Ok(ToggleSetting::Volume { percent })
+        }
         "dark_mode" | "dark mode" => Ok(ToggleSetting::DarkMode {
             enabled: bool_value(value, "Dark mode")?,
         }),
@@ -667,6 +697,7 @@ fn toggle_preview(setting: &ToggleSetting) -> String {
             format!("Turn Wi-Fi {}.", if *enabled { "on" } else { "off" })
         }
         ToggleSetting::Brightness { percent } => format!("Set screen brightness to {}%.", percent),
+        ToggleSetting::Volume { percent } => format!("Set system volume to {}%.", percent),
         ToggleSetting::DarkMode { enabled } => {
             format!("Turn dark mode {}.", if *enabled { "on" } else { "off" })
         }
@@ -994,6 +1025,7 @@ struct ConfirmationPreview {
 enum ToggleSetting {
     Wifi { enabled: bool },
     Brightness { percent: u8 },
+    Volume { percent: u8 },
     DarkMode { enabled: bool },
     DoNotDisturb { enabled: bool },
 }
@@ -1657,6 +1689,10 @@ fn execute_toggle(setting: &ToggleSetting) -> Result<ToolExecution, String> {
         ToggleSetting::Brightness { percent } => {
             let value = format!("{}%", percent);
             run_setting_command("brightnessctl", &["set", &value])?;
+        }
+        ToggleSetting::Volume { percent } => {
+            let value = format!("{}%", percent);
+            run_setting_command("pactl", &["set-sink-volume", "@DEFAULT_SINK@", &value])?;
         }
         ToggleSetting::DarkMode { enabled } => {
             run_setting_command(
@@ -2415,6 +2451,15 @@ mod tests {
             .expect("light mode should be parsed locally");
         assert_eq!(intent.params.setting_name.as_deref(), Some("dark_mode"));
         assert_eq!(intent.params.value, Some(json!(false)));
+    }
+
+    #[test]
+    fn volume_request_is_locally_parsed_and_bounded() {
+        let intent = local_toggle_request("set volume to 35%")
+            .expect("volume request should be parsed locally");
+        assert_eq!(intent.params.setting_name.as_deref(), Some("volume"));
+        assert_eq!(intent.params.value, Some(json!(35)));
+        assert!(local_toggle_request("set volume to 120%").is_none());
     }
 
     #[test]

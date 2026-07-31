@@ -71,6 +71,7 @@ Current Linux adapters:
 - brightness from 0–100% through `brightnessctl`
 - GNOME dark mode through `gsettings`
 - GNOME Do Not Disturb through `gsettings`
+- system volume from 0–100% through PipeWire/PulseAudio `pactl`
 - play, pause, next, and previous track through `playerctl`
 - explicit desktop notifications through `notify-send` (install `libnotify-bin` on Debian/Ubuntu if needed)
 
