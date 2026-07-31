@@ -70,8 +70,9 @@ Current Linux adapters:
 - GNOME dark mode through `gsettings`
 - GNOME Do Not Disturb through `gsettings`
 - play, pause, next, and previous track through `playerctl`
+- explicit desktop notifications through `notify-send` (install `libnotify-bin` on Debian/Ubuntu if needed)
 
-Application and media phrases such as `open firefox`, `opn files`, `pause music`, and `next song` are locally parsed before Ollama, then presented for confirmation. This preserves responsiveness even on a low-resource VM.
+Application, media, and notification phrases such as `open firefox`, `opn files`, `pause music`, `next song`, and `remind me to drink water` are locally parsed before Ollama, then presented for confirmation. This preserves responsiveness even on a low-resource VM.
 
 ## Local audit history (Step 5)
 

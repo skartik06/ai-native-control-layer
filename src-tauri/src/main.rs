@@ -33,6 +33,7 @@ enum Action {
     ReadRecentLogs,
     LaunchApp,
     MediaControl,
+    SendNotification,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -67,6 +68,7 @@ struct IntentParams {
     lines: Option<u32>,
     app_name: Option<String>,
     media_command: Option<String>,
+    notification_body: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -126,11 +128,11 @@ struct OllamaModel {
 fn system_prompt() -> &'static str {
     r#"You are the intent parser for a safety-first Linux desktop assistant. Return ONLY one JSON object, with no Markdown or explanation. It must have action, params, risk_tier, confidence, clarification_needed, and clarification_question keys.
 
-Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs, media_control. Any request to open or launch an application, change an unlisted setting, delete files, install software, or perform an unsupported action MUST set clarification_needed to true. Use action "search_files", params {}, risk_tier "low", confidence below 0.9, and ask the user what supported task they want instead.
+Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs, media_control, send_notification. Any request to open or launch an application, change an unlisted setting, delete files, install software, or perform an unsupported action MUST set clarification_needed to true. Use action "search_files", params {}, risk_tier "low", confidence below 0.9, and ask the user what supported task they want instead.
 
-Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines. media_control requires media_command (play, pause, next, or previous).
+Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines. media_control requires media_command (play, pause, next, or previous). send_notification requires notification_body.
 
-Use low risk only for read-only actions; medium only for toggle_setting and media_control. Params may use only query, filters, directory, threshold_mb, setting_name, value, service_name, lines, media_command. filters may use type, date_range, size_min, size_max, path. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
+Use low risk only for read-only actions; medium only for toggle_setting, media_control, and send_notification. Params may use only query, filters, directory, threshold_mb, setting_name, value, service_name, lines, media_command, notification_body. filters may use type, date_range, size_min, size_max, path. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
 }
 
 fn append_debug_log(app: &AppHandle, user_input: &str, model_output: &str) {
@@ -378,6 +380,28 @@ fn local_media_request(request: &str) -> Option<Intent> {
     })
 }
 
+fn local_notification_request(request: &str) -> Option<Intent> {
+    let trimmed = request.trim();
+    let lower = trimmed.to_lowercase();
+    let body = ["notify me", "remind me"]
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix).map(str::trim))?;
+    if body.is_empty() || body.len() > 280 {
+        return None;
+    }
+    Some(Intent {
+        action: Action::SendNotification,
+        params: IntentParams {
+            notification_body: Some(body.to_string()),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
 fn select_available_model(models: &[OllamaModel]) -> Option<String> {
     ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
         .iter()
@@ -443,6 +467,9 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
             "Ollama returned a media parameter for an incompatible action. No action was taken."
                 .to_string(),
         );
+    }
+    if params.notification_body.is_some() && !matches!(intent.action, Action::SendNotification) {
+        return Err("Ollama returned a notification parameter for an incompatible action. No action was taken.".to_string());
     }
     match intent.action {
         Action::SearchFiles
@@ -531,13 +558,31 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
         {
             Err("Media control requires one supported media command. No action was taken.".to_string())
         }
+        Action::SendNotification
+            if params.notification_body.as_deref().is_none_or(|body| body.trim().is_empty() || body.len() > 280)
+                || params.query.is_some()
+                || params.filters.is_some()
+                || params.directory.is_some()
+                || params.threshold_mb.is_some()
+                || params.setting_name.is_some()
+                || params.value.is_some()
+                || params.service_name.is_some()
+                || params.lines.is_some()
+                || params.app_name.is_some()
+                || params.media_command.is_some() =>
+        {
+            Err("A notification needs a message of at most 280 characters. No action was taken.".to_string())
+        }
         _ => Ok(()),
     }
 }
 
 fn planned_risk(action: Action) -> RiskTier {
     match action {
-        Action::ToggleSetting | Action::LaunchApp | Action::MediaControl => RiskTier::Medium,
+        Action::ToggleSetting
+        | Action::LaunchApp
+        | Action::MediaControl
+        | Action::SendNotification => RiskTier::Medium,
         Action::SearchFiles
         | Action::GetSystemInfo
         | Action::ListLargeFiles
@@ -560,6 +605,9 @@ fn plan_intent(intent: &Intent) -> Result<RiskTier, String> {
     }
     if matches!(intent.action, Action::MediaControl) {
         prepare_media(&intent.params)?;
+    }
+    if matches!(intent.action, Action::SendNotification) {
+        prepare_notification(&intent.params)?;
     }
     Ok(expected_risk)
 }
@@ -667,6 +715,17 @@ fn media_preview(command: &MediaCommand) -> String {
     }
 }
 
+fn prepare_notification(params: &IntentParams) -> Result<String, String> {
+    let body = params.notification_body.as_deref().unwrap_or("").trim();
+    if body.is_empty() || body.len() > 280 {
+        return Err(
+            "A notification needs a message of at most 280 characters. No action was taken."
+                .to_string(),
+        );
+    }
+    Ok(body.to_string())
+}
+
 async fn parse_intent_internal(
     app: AppHandle,
     request: String,
@@ -724,6 +783,14 @@ async fn parse_intent_internal(
             &app,
             request,
             "Locally parsed a media request before Ollama.",
+        );
+        return Ok(intent);
+    }
+    if let Some(intent) = local_notification_request(request) {
+        append_debug_log(
+            &app,
+            request,
+            "Locally parsed a notification request before Ollama.",
         );
         return Ok(intent);
     }
@@ -935,6 +1002,7 @@ enum PendingOperation {
     Toggle(ToggleSetting),
     Launch(LaunchTarget),
     Media(MediaCommand),
+    Notification(String),
 }
 
 struct PendingAction {
@@ -1643,6 +1711,30 @@ fn execute_media(_: &MediaCommand) -> Result<ToolExecution, String> {
     Err("Media control is available in the Linux desktop MVP only.".to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn execute_notification(body: &str) -> Result<ToolExecution, String> {
+    let output = Command::new("notify-send")
+        .args(["Linux Assistant", body])
+        .output()
+        .map_err(|_| {
+            "Could not run notify-send. Install libnotify-bin or your distro equivalent."
+                .to_string()
+        })?;
+    if !output.status.success() {
+        return Err("The Linux desktop notification could not be sent.".to_string());
+    }
+    Ok(ToolExecution {
+        tool: "send_notification".to_string(),
+        summary: format!("Sent local notification: {body}"),
+        data: json!({"sent": true}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_notification(_: &str) -> Result<ToolExecution, String> {
+    Err("Desktop notifications are available in the Linux desktop MVP only.".to_string())
+}
+
 fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
     match intent.action {
         Action::SearchFiles => search_files(&intent.params),
@@ -1658,6 +1750,9 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
         }
         Action::MediaControl => {
             Err("Media changes must pass through the confirmation gate.".to_string())
+        }
+        Action::SendNotification => {
+            Err("Desktop notifications must pass through the confirmation gate.".to_string())
         }
     }
 }
@@ -1771,6 +1866,11 @@ async fn process_request(
                         media_preview(&command),
                     )
                 }
+                Action::SendNotification => {
+                    let body = prepare_notification(&intent.params)?;
+                    let preview = format!("Send a desktop notification: {body}");
+                    (PendingOperation::Notification(body), preview)
+                }
                 _ => {
                     return Err(
                         "Unsupported confirmation operation. No action was taken.".to_string()
@@ -1870,6 +1970,7 @@ fn confirm_pending_action(
         PendingOperation::Toggle(setting) => execute_toggle(setting),
         PendingOperation::Launch(target) => execute_launch(target),
         PendingOperation::Media(command) => execute_media(command),
+        PendingOperation::Notification(body) => execute_notification(body),
     };
     match execution_result {
         Ok(mut execution) => {
@@ -2205,6 +2306,18 @@ mod tests {
         assert!(matches!(intent.action, Action::MediaControl));
         assert!(matches!(plan_intent(&intent), Ok(RiskTier::Medium)));
         assert_eq!(intent.params.media_command.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn local_notification_requests_bypass_the_model_and_require_confirmation() {
+        let intent = local_notification_request("remind me to drink water")
+            .expect("notification request should be parsed locally");
+        assert!(matches!(intent.action, Action::SendNotification));
+        assert!(matches!(plan_intent(&intent), Ok(RiskTier::Medium)));
+        assert_eq!(
+            intent.params.notification_body.as_deref(),
+            Some("to drink water")
+        );
     }
 
     #[test]
