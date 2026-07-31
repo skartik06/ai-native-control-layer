@@ -36,6 +36,13 @@ type AuditEntry = {
   summary: string;
 };
 
+type RuntimeProfile = {
+  profile: string;
+  total_memory_gb: number;
+  cpu_cores: number;
+  summary: string;
+};
+
 function readableError(error: unknown) {
   return String(error).replace(/^Error:\s*/, "");
 }
@@ -47,6 +54,7 @@ function App() {
   const [confirmation, setConfirmation] = useState<ConfirmationPreview | null>(null);
   const [history, setHistory] = useState<AuditEntry[] | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [runtimeProfile, setRuntimeProfile] = useState<RuntimeProfile | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -64,6 +72,14 @@ function App() {
     };
     void setupShortcut();
     return () => { void import("@tauri-apps/plugin-global-shortcut").then(({ unregister }) => unregister(shortcut)); };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) => invoke<RuntimeProfile>("get_runtime_profile"))
+      .then(setRuntimeProfile)
+      .catch(() => setRuntimeProfile(null));
   }, []);
 
   useEffect(() => {
@@ -158,11 +174,12 @@ function App() {
 
   return <main className="overlay-shell">
     <section className="command-palette" aria-label="AI Native Control Layer">
-      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>LINUX ASSISTANT</span><span className="profile-badge">FULL DESKTOP · ALPHA</span><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button>{loading && <button className="stop-button" type="button" onClick={stopCurrentRequest}>Stop</button>}<kbd>Ctrl Space</kbd></div>
+      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>LINUX ASSISTANT</span><span className="profile-badge">{runtimeProfile ? `${runtimeProfile.profile.toUpperCase()} PROFILE · ALPHA` : "CHECKING PROFILE"}</span><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button>{loading && <button className="stop-button" type="button" onClick={stopCurrentRequest}>Stop</button>}<kbd>Ctrl Space</kbd></div>
       <section className="assistant-intro">
         <p className="eyebrow">PRIVATE · LOCAL-FIRST · SAFETY-GATED</p>
         <h1>What can I help you do?</h1>
         <p>Control your Linux desktop, inspect your system, and safely launch supported apps. Voice and opt-in personal memory are next.</p>
+        {runtimeProfile && <p className="runtime-summary">{runtimeProfile.summary} Detected: {runtimeProfile.total_memory_gb} GB RAM · {runtimeProfile.cpu_cores} CPU cores.</p>}
         <div className="capability-row"><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span><span>Audit trail</span></div>
       </section>
       <form onSubmit={submit}>

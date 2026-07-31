@@ -807,6 +807,23 @@ struct AuditEntry {
     result_json: Option<String>,
 }
 
+#[derive(Serialize)]
+struct RuntimeProfile {
+    profile: String,
+    total_memory_gb: u64,
+    cpu_cores: usize,
+    summary: String,
+}
+
+#[derive(Serialize)]
+struct MemoryEntry {
+    id: i64,
+    created_at: String,
+    category: String,
+    memory_key: String,
+    value: String,
+}
+
 fn open_audit_database(app: &AppHandle) -> Result<Connection, String> {
     let data_dir = app
         .path()
@@ -837,7 +854,15 @@ fn initialize_audit_database(connection: &Connection) -> Result<(), String> {
                 summary TEXT NOT NULL,
                 result_json TEXT
             );
-            CREATE INDEX IF NOT EXISTS audit_events_timestamp_idx ON audit_events(timestamp DESC);",
+            CREATE INDEX IF NOT EXISTS audit_events_timestamp_idx ON audit_events(timestamp DESC);
+            CREATE TABLE IF NOT EXISTS assistant_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                category TEXT NOT NULL,
+                memory_key TEXT NOT NULL,
+                value TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS assistant_memory_created_at_idx ON assistant_memory(created_at DESC);",
         )
         .map_err(|_| "Could not initialize the local audit database.".to_string())?;
     Ok(())
@@ -1618,6 +1643,104 @@ fn get_audit_history(app: AppHandle, limit: Option<u32>) -> Result<Vec<AuditEntr
     Ok(events)
 }
 
+#[tauri::command]
+fn get_runtime_profile() -> RuntimeProfile {
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let total_memory_gb = system.total_memory() / 1024 / 1024 / 1024;
+    let cpu_cores = system.cpus().len();
+    let profile = if total_memory_gb >= 12 && cpu_cores >= 6 {
+        "full"
+    } else {
+        "lite"
+    };
+    let summary = if profile == "full" {
+        "Full Desktop profile recommended. This system is suitable for richer local assistant features."
+    } else {
+        "Lite profile recommended. Fast local actions are enabled; larger voice and chat models may need more RAM or a GPU."
+    };
+    RuntimeProfile {
+        profile: profile.to_string(),
+        total_memory_gb,
+        cpu_cores,
+        summary: summary.to_string(),
+    }
+}
+
+#[tauri::command]
+fn remember_preference(
+    app: AppHandle,
+    category: String,
+    memory_key: String,
+    value: String,
+) -> Result<MemoryEntry, String> {
+    let category = category.trim();
+    let memory_key = memory_key.trim();
+    let value = value.trim();
+    if category.is_empty() || memory_key.is_empty() || value.is_empty() || value.len() > 500 {
+        return Err("Memory needs a category, key, and a value under 500 characters.".to_string());
+    }
+    let connection = open_audit_database(&app)?;
+    let created_at = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO assistant_memory (created_at, category, memory_key, value) VALUES (?1, ?2, ?3, ?4)",
+            params![created_at, category, memory_key, value],
+        )
+        .map_err(|_| "Could not save the local preference.".to_string())?;
+    Ok(MemoryEntry {
+        id: connection.last_insert_rowid(),
+        created_at,
+        category: category.to_string(),
+        memory_key: memory_key.to_string(),
+        value: value.to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_memory(app: AppHandle) -> Result<Vec<MemoryEntry>, String> {
+    let connection = open_audit_database(&app)?;
+    let mut statement = connection
+        .prepare("SELECT id, created_at, category, memory_key, value FROM assistant_memory ORDER BY id DESC LIMIT 100")
+        .map_err(|_| "Could not read local memory.".to_string())?;
+    statement
+        .query_map([], |row| {
+            Ok(MemoryEntry {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                category: row.get(2)?,
+                memory_key: row.get(3)?,
+                value: row.get(4)?,
+            })
+        })
+        .map_err(|_| "Could not read local memory.".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read local memory.".to_string())
+}
+
+#[tauri::command]
+fn forget_memory(app: AppHandle, id: i64) -> Result<String, String> {
+    let connection = open_audit_database(&app)?;
+    let removed = connection
+        .execute("DELETE FROM assistant_memory WHERE id = ?1", params![id])
+        .map_err(|_| "Could not remove the local memory entry.".to_string())?;
+    Ok(if removed == 1 {
+        "Memory entry removed."
+    } else {
+        "Memory entry was not found."
+    }
+    .to_string())
+}
+
+#[tauri::command]
+fn delete_all_memory(app: AppHandle) -> Result<String, String> {
+    let connection = open_audit_database(&app)?;
+    connection
+        .execute("DELETE FROM assistant_memory", [])
+        .map_err(|_| "Could not clear local memory.".to_string())?;
+    Ok("All opt-in assistant memory was deleted.".to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -1629,7 +1752,12 @@ fn main() {
             stop_request,
             confirm_pending_action,
             cancel_pending_action,
-            get_audit_history
+            get_audit_history,
+            get_runtime_profile,
+            remember_preference,
+            get_memory,
+            forget_memory,
+            delete_all_memory
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");
