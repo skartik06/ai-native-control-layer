@@ -6,10 +6,25 @@ body { margin: 0; background: transparent; overflow: hidden; }
 .brand-row { display: flex; align-items: center; gap: 9px; padding: 14px 18px; color: #aebfdf; font-size: 11px; font-weight: 700; letter-spacing: .12em; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #68e8b2; box-shadow: 0 0 12px #68e8b2; }
 kbd { margin-left: auto; border: 1px solid #344462; border-radius: 5px; padding: 3px 6px; color: #8fa1c0; font: inherit; letter-spacing: 0; }
+.history-toggle { margin-left: auto; border: 1px solid #425474; border-radius: 5px; padding: 4px 7px; background: transparent; color: #b9c8e4; font: 700 10px/1 inherit; letter-spacing: .04em; cursor: pointer; }
+.history-toggle:disabled { opacity: .6; cursor: wait; }
+.history-toggle + kbd { margin-left: 0; }
 form { border-top: 1px solid #27344e; border-bottom: 1px solid #27344e; }
 input { width: 100%; border: 0; outline: 0; padding: 21px 18px; background: transparent; color: #fff; font: 500 18px/1.4 inherit; }
 input::placeholder { color: #70809d; }
 .response { max-height: 220px; margin: 0; overflow: auto; padding: 16px 18px; color: #c9d8f6; white-space: pre-wrap; background: rgba(91, 129, 195, .12); font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.audit-history { max-height: 245px; overflow: auto; padding: 14px 18px; border-bottom: 1px solid #27344e; background: rgba(26, 42, 70, .36); }
+.audit-heading { display: flex; justify-content: space-between; gap: 12px; color: #dce7fb; font-size: 12px; }
+.audit-heading span, .empty-history { margin: 0; color: #8292af; font-size: 11px; }
+.audit-history ul { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.audit-history li { padding: 10px; border: 1px solid #2c3b58; border-radius: 7px; background: rgba(5, 11, 23, .28); }
+.audit-history li > div { display: flex; align-items: center; gap: 8px; }
+.audit-history code { color: #b7c8e8; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.audit-history p { margin: 7px 0 4px; color: #c5d4ec; font-size: 12px; }
+.audit-history time { color: #7788a4; font-size: 10px; }
+.outcome { display: inline-block; border-radius: 99px; padding: 3px 6px; color: #f7e5ad; background: rgba(230, 178, 67, .15); font-size: 10px; text-transform: capitalize; }
+.outcome-success { color: #83e7bc; background: rgba(88, 201, 151, .15); }
+.outcome-failed, .outcome-rejected { color: #ffa5ac; background: rgba(230, 95, 105, .15); }
 .confirmation { padding: 14px 18px; border-bottom: 1px solid #27344e; background: rgba(230, 178, 67, .12); color: #f7e5ad; }
 .confirmation p { margin: 0 0 4px; font-weight: 650; }
 .confirmation small { color: #bda873; }

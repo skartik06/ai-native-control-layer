@@ -28,11 +28,21 @@ type ToolExecution = {
   data: unknown;
 };
 
+type AuditEntry = {
+  id: number;
+  timestamp: string;
+  action: string;
+  outcome: string;
+  summary: string;
+};
+
 function App() {
   const [input, setInput] = useState("");
   const [response, setResponse] = useState("");
   const [loading, setLoading] = useState(false);
   const [confirmation, setConfirmation] = useState<ConfirmationPreview | null>(null);
+  const [history, setHistory] = useState<AuditEntry[] | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -100,6 +110,26 @@ function App() {
     } finally { setLoading(false); }
   }
 
+  async function toggleHistory() {
+    if (!isTauri) {
+      setResponse("Audit history is available in the native desktop app.");
+      return;
+    }
+    if (history) {
+      setHistory(null);
+      return;
+    }
+    setHistoryLoading(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setHistory(await invoke<AuditEntry[]>("get_audit_history", { limit: 20 }));
+    } catch (error) {
+      setResponse(`Could not load audit history: ${String(error)}`);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
   async function cancel() {
     if (!isTauri || !confirmation) return;
     try {
@@ -114,7 +144,7 @@ function App() {
 
   return <main className="overlay-shell">
     <section className="command-palette" aria-label="AI Native Control Layer">
-      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>CONTROL LAYER</span><kbd>Ctrl Space</kbd></div>
+      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>CONTROL LAYER</span><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button><kbd>Ctrl Space</kbd></div>
       <form onSubmit={submit}>
         <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
           placeholder="Ask your computer anything..." aria-label="Command input" />
@@ -128,6 +158,13 @@ function App() {
         </div>
       </section>}
       {response && <pre className="response" role="status">{response}</pre>}
+      {history && <section className="audit-history" aria-label="Local audit history">
+        <div className="audit-heading"><strong>Local audit history</strong><span>Latest {history.length} events</span></div>
+        {history.length === 0 ? <p className="empty-history">No events recorded yet.</p> : <ul>{history.map((entry) => <li key={entry.id}>
+          <div><span className={`outcome outcome-${entry.outcome}`}>{entry.outcome.replaceAll("_", " ")}</span><code>{entry.action}</code></div>
+          <p>{entry.summary}</p><time>{new Date(entry.timestamp).toLocaleString()}</time>
+        </li>)}</ul>}
+      </section>}
       <p className="hint">{loading ? "Working..." : confirmation ? "Nothing changes until you confirm." : "Linux MVP · read-only tools run automatically; changes require confirmation."}</p>
     </section>
   </main>;
