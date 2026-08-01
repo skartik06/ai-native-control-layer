@@ -36,6 +36,7 @@ enum Action {
     SendNotification,
     TakeScreenshot,
     ReadClipboard,
+    WindowControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -71,6 +72,8 @@ struct IntentParams {
     app_name: Option<String>,
     media_command: Option<String>,
     notification_body: Option<String>,
+    window_name: Option<String>,
+    window_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -459,6 +462,36 @@ fn local_clipboard_request(request: &str) -> Option<Intent> {
     })
 }
 
+fn local_window_request(request: &str) -> Option<Intent> {
+    let request = request.trim();
+    let lower = request.to_lowercase();
+    let (prefix, command) = [
+        ("minimize ", "minimize"),
+        ("maximize ", "maximize"),
+        ("focus ", "focus"),
+        ("close window ", "close"),
+        ("close app ", "close"),
+    ]
+    .iter()
+    .find_map(|(prefix, command)| lower.strip_prefix(prefix).map(|name| (*name, *command)))?;
+    let name = prefix.trim();
+    if name.is_empty() || name.len() > 100 {
+        return None;
+    }
+    Some(Intent {
+        action: Action::WindowControl,
+        params: IntentParams {
+            window_name: Some(name.to_string()),
+            window_command: Some(command.to_string()),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
 fn select_available_model(models: &[OllamaModel]) -> Option<String> {
     ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
         .iter()
@@ -632,6 +665,7 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
         }
         Action::TakeScreenshot if params.query.is_some() || params.filters.is_some() || params.directory.is_some() || params.threshold_mb.is_some() || params.setting_name.is_some() || params.value.is_some() || params.service_name.is_some() || params.lines.is_some() || params.app_name.is_some() || params.media_command.is_some() || params.notification_body.is_some() => Err("Screenshot capture does not accept extra parameters. No action was taken.".to_string()),
         Action::ReadClipboard if params.query.is_some() || params.filters.is_some() || params.directory.is_some() || params.threshold_mb.is_some() || params.setting_name.is_some() || params.value.is_some() || params.service_name.is_some() || params.lines.is_some() || params.app_name.is_some() || params.media_command.is_some() || params.notification_body.is_some() => Err("Clipboard reading does not accept extra parameters. No action was taken.".to_string()),
+        Action::WindowControl if params.window_name.as_deref().is_none_or(|name| name.trim().is_empty() || name.len() > 100) || !matches!(params.window_command.as_deref(), Some("focus" | "minimize" | "maximize" | "close")) => Err("Window control requires a supported command and window name. No action was taken.".to_string()),
         _ => Ok(()),
     }
 }
@@ -643,6 +677,7 @@ fn planned_risk(action: Action) -> RiskTier {
         | Action::MediaControl
         | Action::SendNotification
         | Action::TakeScreenshot => RiskTier::Medium,
+        Action::WindowControl => RiskTier::Medium,
         Action::SearchFiles
         | Action::GetSystemInfo
         | Action::ListLargeFiles
@@ -872,6 +907,9 @@ async fn parse_intent_internal(
     if let Some(intent) = local_clipboard_request(request) {
         return Ok(intent);
     }
+    if let Some(intent) = local_window_request(request) {
+        return Ok(intent);
+    }
     let timeout = ollama_timeout();
     let client = Client::builder()
         .timeout(timeout)
@@ -1099,6 +1137,7 @@ enum PendingOperation {
     Media(MediaCommand),
     Notification(String),
     Screenshot,
+    Window { command: String, name: String },
 }
 
 struct PendingAction {
@@ -1910,6 +1949,34 @@ fn read_clipboard() -> Result<ToolExecution, String> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn execute_window(command: &str, name: &str) -> Result<ToolExecution, String> {
+    let args: Vec<&str> = match command {
+        "focus" => vec!["-a", name],
+        "minimize" => vec!["-r", name, "-b", "add,hidden"],
+        "maximize" => vec!["-r", name, "-b", "add,maximized_vert,maximized_horz"],
+        "close" => vec!["-c", name],
+        _ => return Err("Unsupported window command. No action was taken.".to_string()),
+    };
+    let output = Command::new("wmctrl")
+        .args(args)
+        .output()
+        .map_err(|_| "Could not run wmctrl. Install it on this Linux desktop.".to_string())?;
+    if !output.status.success() {
+        return Err("Could not find or control that window.".to_string());
+    }
+    Ok(ToolExecution {
+        tool: "window_control".to_string(),
+        summary: format!("Applied {command} to window: {name}."),
+        data: json!({"command": command, "window": name}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_window(_: &str, _: &str) -> Result<ToolExecution, String> {
+    Err("Window control is available in the Linux desktop build only.".to_string())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn read_clipboard() -> Result<ToolExecution, String> {
     Err("Clipboard reading is available in the Linux desktop build only.".to_string())
@@ -1943,6 +2010,9 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
             Err("Screenshot capture must pass through the confirmation gate.".to_string())
         }
         Action::ReadClipboard => read_clipboard(),
+        Action::WindowControl => {
+            Err("Window control must pass through the confirmation gate.".to_string())
+        }
     }
 }
 
@@ -2064,6 +2134,17 @@ async fn process_request(
                     PendingOperation::Screenshot,
                     "Capture the current screen and save it in Pictures.".to_string(),
                 ),
+                Action::WindowControl => {
+                    let command = intent.params.window_command.clone().unwrap_or_default();
+                    let name = intent.params.window_name.clone().unwrap_or_default();
+                    (
+                        PendingOperation::Window {
+                            command: command.clone(),
+                            name: name.clone(),
+                        },
+                        format!("{} window: {}.", command, name),
+                    )
+                }
                 _ => {
                     return Err(
                         "Unsupported confirmation operation. No action was taken.".to_string()
@@ -2165,6 +2246,7 @@ fn confirm_pending_action(
         PendingOperation::Media(command) => execute_media(command),
         PendingOperation::Notification(body) => execute_notification(body),
         PendingOperation::Screenshot => execute_screenshot(),
+        PendingOperation::Window { command, name } => execute_window(command, name),
     };
     match execution_result {
         Ok(mut execution) => {
