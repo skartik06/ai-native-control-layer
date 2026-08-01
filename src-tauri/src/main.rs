@@ -35,6 +35,7 @@ enum Action {
     MediaControl,
     SendNotification,
     TakeScreenshot,
+    ReadClipboard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -438,6 +439,26 @@ fn local_screenshot_request(request: &str) -> Option<Intent> {
     })
 }
 
+fn local_clipboard_request(request: &str) -> Option<Intent> {
+    let request = request.to_lowercase();
+    ([
+        "show clipboard",
+        "read clipboard",
+        "whats on my clipboard",
+        "what is on my clipboard",
+    ]
+    .iter()
+    .any(|term| request.contains(term)))
+    .then(|| Intent {
+        action: Action::ReadClipboard,
+        params: IntentParams::default(),
+        risk_tier: RiskTier::Low,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
 fn select_available_model(models: &[OllamaModel]) -> Option<String> {
     ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
         .iter()
@@ -610,6 +631,7 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
             Err("A notification needs a message of at most 280 characters. No action was taken.".to_string())
         }
         Action::TakeScreenshot if params.query.is_some() || params.filters.is_some() || params.directory.is_some() || params.threshold_mb.is_some() || params.setting_name.is_some() || params.value.is_some() || params.service_name.is_some() || params.lines.is_some() || params.app_name.is_some() || params.media_command.is_some() || params.notification_body.is_some() => Err("Screenshot capture does not accept extra parameters. No action was taken.".to_string()),
+        Action::ReadClipboard if params.query.is_some() || params.filters.is_some() || params.directory.is_some() || params.threshold_mb.is_some() || params.setting_name.is_some() || params.value.is_some() || params.service_name.is_some() || params.lines.is_some() || params.app_name.is_some() || params.media_command.is_some() || params.notification_body.is_some() => Err("Clipboard reading does not accept extra parameters. No action was taken.".to_string()),
         _ => Ok(()),
     }
 }
@@ -625,7 +647,8 @@ fn planned_risk(action: Action) -> RiskTier {
         | Action::GetSystemInfo
         | Action::ListLargeFiles
         | Action::GetNetworkStatus
-        | Action::ReadRecentLogs => RiskTier::Low,
+        | Action::ReadRecentLogs
+        | Action::ReadClipboard => RiskTier::Low,
     }
 }
 
@@ -844,6 +867,9 @@ async fn parse_intent_internal(
         return Ok(intent);
     }
     if let Some(intent) = local_screenshot_request(request) {
+        return Ok(intent);
+    }
+    if let Some(intent) = local_clipboard_request(request) {
         return Ok(intent);
     }
     let timeout = ollama_timeout();
@@ -1857,6 +1883,38 @@ fn execute_screenshot() -> Result<ToolExecution, String> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn read_clipboard() -> Result<ToolExecution, String> {
+    let output = Command::new("wl-paste")
+        .arg("--no-newline")
+        .output()
+        .or_else(|_| {
+            Command::new("xclip")
+                .args(["-o", "-selection", "clipboard"])
+                .output()
+        })
+        .map_err(|_| {
+            "Install wl-clipboard (Wayland) or xclip (X11) to read the clipboard.".to_string()
+        })?;
+    if !output.status.success() {
+        return Err("Could not read the desktop clipboard.".to_string());
+    }
+    let text = String::from_utf8_lossy(&output.stdout)
+        .chars()
+        .take(10_000)
+        .collect::<String>();
+    Ok(ToolExecution {
+        tool: "read_clipboard".to_string(),
+        summary: "Read the current desktop clipboard.".to_string(),
+        data: json!({"text": text}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_clipboard() -> Result<ToolExecution, String> {
+    Err("Clipboard reading is available in the Linux desktop build only.".to_string())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn execute_screenshot() -> Result<ToolExecution, String> {
     Err("Screenshot capture is available in the Linux desktop build only.".to_string())
@@ -1884,6 +1942,7 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
         Action::TakeScreenshot => {
             Err("Screenshot capture must pass through the confirmation gate.".to_string())
         }
+        Action::ReadClipboard => read_clipboard(),
     }
 }
 
