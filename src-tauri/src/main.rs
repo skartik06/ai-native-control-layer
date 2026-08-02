@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use reqwest::Client;
 use rusqlite::{params, Connection};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
@@ -36,7 +36,10 @@ enum Action {
     SendNotification,
     TakeScreenshot,
     ReadClipboard,
+    WriteClipboard,
     WindowControl,
+    WifiConnect,
+    WifiDisconnect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -74,6 +77,8 @@ struct IntentParams {
     notification_body: Option<String>,
     window_name: Option<String>,
     window_command: Option<String>,
+    clipboard_text: Option<String>,
+    network_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -133,11 +138,11 @@ struct OllamaModel {
 fn system_prompt() -> &'static str {
     r#"You are the intent parser for a safety-first Linux desktop assistant. Return ONLY one JSON object, with no Markdown or explanation. It must have action, params, risk_tier, confidence, clarification_needed, and clarification_question keys.
 
-Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs, media_control, send_notification. Any request to open or launch an application, change an unlisted setting, delete files, install software, or perform an unsupported action MUST set clarification_needed to true. Use action "search_files", params {}, risk_tier "low", confidence below 0.9, and ask the user what supported task they want instead.
+Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs, launch_app, media_control, send_notification, take_screenshot, read_clipboard, write_clipboard, window_control, wifi_connect, wifi_disconnect. Any request to delete files, install software, or perform an unsupported action MUST set clarification_needed to true.
 
-Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, volume, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines. media_control requires media_command (play, pause, next, or previous). send_notification requires notification_body.
+Parameter rules: get_system_info and get_network_status require params {}. search_files requires query and/or filters. list_large_files requires directory and threshold_mb. toggle_setting requires setting_name (wifi, brightness, volume, dark_mode, or do_not_disturb) and value. read_recent_logs requires service_name and lines. media_control requires media_command (play, pause, next, or previous). send_notification requires notification_body. write_clipboard requires clipboard_text (the text to copy, max 2000 chars). window_control requires window_name and window_command (focus, minimize, maximize, or close). wifi_connect requires network_name (the saved NetworkManager connection profile name). wifi_disconnect requires network_name.
 
-Use low risk only for read-only actions; medium only for toggle_setting, media_control, and send_notification. Params may use only query, filters, directory, threshold_mb, setting_name, value, service_name, lines, media_command, notification_body. filters may use type, date_range, size_min, size_max, path. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
+Use low risk only for read-only actions (search_files, get_system_info, list_large_files, get_network_status, read_recent_logs, read_clipboard); medium only for toggle_setting, launch_app, media_control, send_notification, take_screenshot, write_clipboard, window_control, wifi_connect, wifi_disconnect. confidence MUST be a JSON number from 0 to 1, for example 0.95; never use words such as high, medium, or low. If ambiguous or confidence below 0.9, set clarification_needed true and provide a non-empty clarification_question. Never invent an unlisted action."#
 }
 
 fn append_debug_log(app: &AppHandle, user_input: &str, model_output: &str) {
@@ -497,7 +502,269 @@ fn local_window_request(request: &str) -> Option<Intent> {
     })
 }
 
-fn select_available_model(models: &[OllamaModel]) -> Option<String> {
+// ── Clipboard write ─────────────────────────────────────────────────────────
+
+fn local_clipboard_write_request(request: &str) -> Option<Intent> {
+    let lower = request.trim().to_lowercase();
+    let text_lower: &str = if let Some(t) = lower
+        .strip_prefix("copy ")
+        .and_then(|s| s.strip_suffix(" to clipboard"))
+    {
+        t
+    } else if let Some(t) = lower.strip_prefix("set clipboard to ") {
+        t
+    } else if let Some(t) = lower
+        .strip_prefix("write ")
+        .and_then(|s| s.strip_suffix(" to clipboard"))
+    {
+        t
+    } else {
+        return None;
+    };
+    let text_lower = text_lower.trim();
+    if text_lower.is_empty() || text_lower.len() > 2_000 {
+        return None;
+    }
+    // Preserve original casing by finding the slice in the original request.
+    let orig_lower = request.to_lowercase();
+    let text = if let Some(pos) = orig_lower.find(text_lower) {
+        request[pos..pos + text_lower.len()].trim().to_string()
+    } else {
+        text_lower.to_string()
+    };
+    Some(Intent {
+        action: Action::WriteClipboard,
+        params: IntentParams {
+            clipboard_text: Some(text),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
+// ── Wi-Fi connect / disconnect ────────────────────────────────────────────────
+
+fn is_valid_network_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, ' ' | '-' | '_' | '.' | '@' | ':' | '!')
+        })
+}
+
+fn local_wifi_connect_request(request: &str) -> Option<Intent> {
+    let lower = request.trim().to_lowercase();
+    let name: &str = if let Some(n) = lower.strip_prefix("connect to wifi ") {
+        n
+    } else if let Some(n) = lower.strip_prefix("join wifi ") {
+        n
+    } else if let Some(n) = lower.strip_prefix("connect wifi ") {
+        n
+    } else if let Some(n) = lower
+        .strip_prefix("connect to ")
+        .filter(|n| !n.trim().is_empty())
+    {
+        n
+    } else {
+        return None;
+    };
+    let name = name.trim();
+    if name.is_empty() || !is_valid_network_name(name) {
+        return None;
+    }
+    Some(Intent {
+        action: Action::WifiConnect,
+        params: IntentParams {
+            network_name: Some(name.to_string()),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
+fn local_wifi_disconnect_request(request: &str) -> Option<Intent> {
+    let lower = request.trim().to_lowercase();
+    // Only match when a specific network name is provided with wifi context.
+    if !lower.contains("wifi")
+        && !lower.contains("wi-fi")
+        && !lower.contains("network")
+        && !lower.contains("connection")
+    {
+        return None;
+    }
+    let name: &str = if let Some(n) = lower.strip_prefix("disconnect from wifi ") {
+        n
+    } else if let Some(n) = lower.strip_prefix("disconnect wifi ") {
+        n
+    } else if let Some(n) = lower.strip_prefix("disconnect from network ") {
+        n
+    } else if let Some(n) = lower.strip_prefix("disconnect from connection ") {
+        n
+    } else {
+        return None;
+    };
+    let name = name.trim();
+    if name.is_empty() || !is_valid_network_name(name) {
+        return None;
+    }
+    Some(Intent {
+        action: Action::WifiDisconnect,
+        params: IntentParams {
+            network_name: Some(name.to_string()),
+            ..Default::default()
+        },
+        risk_tier: RiskTier::Medium,
+        confidence: 1.0,
+        clarification_needed: false,
+        clarification_question: None,
+    })
+}
+
+// ── Natural-language reminder parser (used by parse_reminder_text command) ──
+
+fn parse_time_str(s: &str) -> Option<NaiveTime> {
+    let s = s.trim().to_lowercase();
+    let s = s.as_str();
+    let (nums, is_pm, is_am) = if s.ends_with(" pm") {
+        (&s[..s.len() - 3], true, false)
+    } else if s.ends_with("pm") {
+        (&s[..s.len() - 2], true, false)
+    } else if s.ends_with(" am") {
+        (&s[..s.len() - 3], false, true)
+    } else if s.ends_with("am") {
+        (&s[..s.len() - 2], false, true)
+    } else {
+        (s, false, false)
+    };
+    let nums = nums.trim();
+    let (h, m) = if let Some(pos) = nums.find(':') {
+        let h: u32 = nums[..pos].parse().ok()?;
+        let m: u32 = nums[pos + 1..].parse().ok()?;
+        (h, m)
+    } else {
+        let h: u32 = nums.parse().ok()?;
+        (h, 0u32)
+    };
+    let h = if is_pm && h < 12 {
+        h + 12
+    } else if is_am && h == 12 {
+        0
+    } else {
+        h
+    };
+    if h > 23 || m > 59 {
+        return None;
+    }
+    NaiveTime::from_hms_opt(h, m, 0)
+}
+
+fn parse_reminder_natural(text: &str) -> Option<(String, String)> {
+    let lower = text.trim().to_lowercase();
+    let now = Utc::now();
+
+    // Pattern: "remind me in N minutes/hours/days to <msg>"
+    if let Some(rest) = lower.strip_prefix("remind me in ") {
+        let to_pos = rest.find(" to ")?;
+        let amount_unit = rest[..to_pos].trim();
+        let msg_lower = rest[to_pos + 4..].trim();
+        if msg_lower.is_empty() || msg_lower.len() > 500 {
+            return None;
+        }
+        let mut parts = amount_unit.splitn(2, ' ');
+        let n: i64 = parts.next()?.parse().ok()?;
+        if n <= 0 || n > 10_000 {
+            return None;
+        }
+        let unit = parts.next()?;
+        let delta = match unit {
+            "minute" | "minutes" | "min" | "mins" => ChronoDuration::minutes(n),
+            "hour" | "hours" | "hr" | "hrs" => ChronoDuration::hours(n),
+            "day" | "days" => ChronoDuration::days(n),
+            _ => return None,
+        };
+        let due = now + delta;
+        // Recover original-case message.
+        let orig_lower = text.to_lowercase();
+        let msg = if let Some(pos) = orig_lower.rfind(msg_lower) {
+            text[pos..pos + msg_lower.len()].trim().to_string()
+        } else {
+            msg_lower.to_string()
+        };
+        return Some((due.to_rfc3339(), msg));
+    }
+
+    // Pattern: "remind me tomorrow at HH:MM [am/pm] to <msg>"
+    if let Some(rest) = lower.strip_prefix("remind me tomorrow at ") {
+        let to_pos = rest.find(" to ")?;
+        let time_str = &rest[..to_pos];
+        let msg_lower = rest[to_pos + 4..].trim();
+        if msg_lower.is_empty() || msg_lower.len() > 500 {
+            return None;
+        }
+        let time = parse_time_str(time_str)?;
+        let tomorrow: NaiveDate = now.date_naive() + ChronoDuration::days(1);
+        let due = NaiveDateTime::new(tomorrow, time).and_utc();
+        let orig_lower = text.to_lowercase();
+        let msg = if let Some(pos) = orig_lower.rfind(msg_lower) {
+            text[pos..pos + msg_lower.len()].trim().to_string()
+        } else {
+            msg_lower.to_string()
+        };
+        return Some((due.to_rfc3339(), msg));
+    }
+
+    // Pattern: "remind me tomorrow to <msg>" (default 09:00)
+    if let Some(rest) = lower.strip_prefix("remind me tomorrow to ") {
+        let msg_lower = rest.trim();
+        if msg_lower.is_empty() || msg_lower.len() > 500 {
+            return None;
+        }
+        let time = NaiveTime::from_hms_opt(9, 0, 0)?;
+        let tomorrow: NaiveDate = now.date_naive() + ChronoDuration::days(1);
+        let due = NaiveDateTime::new(tomorrow, time).and_utc();
+        let orig_lower = text.to_lowercase();
+        let msg = if let Some(pos) = orig_lower.rfind(msg_lower) {
+            text[pos..pos + msg_lower.len()].trim().to_string()
+        } else {
+            msg_lower.to_string()
+        };
+        return Some((due.to_rfc3339(), msg));
+    }
+
+    // Pattern: "remind me at HH:MM [am/pm] to <msg>" (today, or tomorrow if past)
+    if let Some(rest) = lower.strip_prefix("remind me at ") {
+        let to_pos = rest.find(" to ")?;
+        let time_str = &rest[..to_pos];
+        let msg_lower = rest[to_pos + 4..].trim();
+        if msg_lower.is_empty() || msg_lower.len() > 500 {
+            return None;
+        }
+        let time = parse_time_str(time_str)?;
+        let today: NaiveDate = now.date_naive();
+        let mut due = NaiveDateTime::new(today, time).and_utc();
+        if due <= now {
+            due = NaiveDateTime::new(today + ChronoDuration::days(1), time).and_utc();
+        }
+        let orig_lower = text.to_lowercase();
+        let msg = if let Some(pos) = orig_lower.rfind(msg_lower) {
+            text[pos..pos + msg_lower.len()].trim().to_string()
+        } else {
+            msg_lower.to_string()
+        };
+        return Some((due.to_rfc3339(), msg));
+    }
+
+    None
+}
+
+
     ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
         .iter()
         .find_map(|preferred| {
@@ -671,6 +938,30 @@ fn validate_intent(intent: &Intent) -> Result<(), String> {
         Action::TakeScreenshot if params.query.is_some() || params.filters.is_some() || params.directory.is_some() || params.threshold_mb.is_some() || params.setting_name.is_some() || params.value.is_some() || params.service_name.is_some() || params.lines.is_some() || params.app_name.is_some() || params.media_command.is_some() || params.notification_body.is_some() => Err("Screenshot capture does not accept extra parameters. No action was taken.".to_string()),
         Action::ReadClipboard if params.query.is_some() || params.filters.is_some() || params.directory.is_some() || params.threshold_mb.is_some() || params.setting_name.is_some() || params.value.is_some() || params.service_name.is_some() || params.lines.is_some() || params.app_name.is_some() || params.media_command.is_some() || params.notification_body.is_some() => Err("Clipboard reading does not accept extra parameters. No action was taken.".to_string()),
         Action::WindowControl if params.window_name.as_deref().is_none_or(|name| name.trim().is_empty() || name.len() > 100) || !matches!(params.window_command.as_deref(), Some("focus" | "minimize" | "maximize" | "close")) => Err("Window control requires a supported command and window name. No action was taken.".to_string()),
+        Action::WriteClipboard
+            if params
+                .clipboard_text
+                .as_deref()
+                .is_none_or(|t| t.trim().is_empty() || t.len() > 2_000) =>
+        {
+            Err("Clipboard write requires a text value of at most 2000 characters. No action was taken.".to_string())
+        }
+        Action::WifiConnect
+            if params
+                .network_name
+                .as_deref()
+                .is_none_or(|n| n.trim().is_empty() || n.len() > 100) =>
+        {
+            Err("Wi-Fi connect requires a non-empty saved network name. No action was taken.".to_string())
+        }
+        Action::WifiDisconnect
+            if params
+                .network_name
+                .as_deref()
+                .map_or(false, |n| n.len() > 100 || n.trim().is_empty()) =>
+        {
+            Err("Wi-Fi disconnect network name is invalid. No action was taken.".to_string())
+        }
         _ => Ok(()),
     }
 }
@@ -681,7 +972,10 @@ fn planned_risk(action: Action) -> RiskTier {
         | Action::LaunchApp
         | Action::MediaControl
         | Action::SendNotification
-        | Action::TakeScreenshot => RiskTier::Medium,
+        | Action::TakeScreenshot
+        | Action::WriteClipboard
+        | Action::WifiConnect
+        | Action::WifiDisconnect => RiskTier::Medium,
         Action::WindowControl => RiskTier::Medium,
         Action::SearchFiles
         | Action::GetSystemInfo
@@ -709,6 +1003,15 @@ fn plan_intent(intent: &Intent) -> Result<RiskTier, String> {
     }
     if matches!(intent.action, Action::SendNotification) {
         prepare_notification(&intent.params)?;
+    }
+    if matches!(intent.action, Action::WriteClipboard) {
+        prepare_clipboard_write(&intent.params)?;
+    }
+    if matches!(intent.action, Action::WifiConnect) {
+        prepare_wifi_connect(&intent.params)?;
+    }
+    if matches!(intent.action, Action::WifiDisconnect) {
+        prepare_wifi_disconnect(&intent.params)?;
     }
     Ok(expected_risk)
 }
@@ -915,6 +1218,18 @@ async fn parse_intent_internal(
         return Ok(intent);
     }
     if let Some(intent) = local_window_request(request) {
+        return Ok(intent);
+    }
+    if let Some(intent) = local_clipboard_write_request(request) {
+        append_debug_log(&app, request, "Locally parsed a clipboard write request.");
+        return Ok(intent);
+    }
+    if let Some(intent) = local_wifi_connect_request(request) {
+        append_debug_log(&app, request, "Locally parsed a Wi-Fi connect request.");
+        return Ok(intent);
+    }
+    if let Some(intent) = local_wifi_disconnect_request(request) {
+        append_debug_log(&app, request, "Locally parsed a Wi-Fi disconnect request.");
         return Ok(intent);
     }
     let timeout = ollama_timeout();
@@ -1146,6 +1461,9 @@ enum PendingOperation {
     Notification(String),
     Screenshot,
     Window { command: String, name: String },
+    WriteClipboard(String),
+    WifiConnect(String),
+    WifiDisconnect(String),
 }
 
 struct PendingAction {
@@ -2035,6 +2353,183 @@ fn execute_screenshot() -> Result<ToolExecution, String> {
     Err("Screenshot capture is available in the Linux desktop build only.".to_string())
 }
 
+// ── Clipboard write prepare/execute ─────────────────────────────────────────────
+
+fn prepare_clipboard_write(params: &IntentParams) -> Result<String, String> {
+    let text = params
+        .clipboard_text
+        .as_deref()
+        .ok_or_else(|| "Clipboard write requires a text value.".to_string())?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("Clipboard text cannot be empty.".to_string());
+    }
+    if text.len() > 2_000 {
+        return Err("Clipboard text must be under 2000 characters.".to_string());
+    }
+    Ok(text.to_string())
+}
+
+fn clipboard_write_preview(text: &str) -> String {
+    format!("Copy {} character(s) to clipboard.", text.chars().count())
+}
+
+#[cfg(target_os = "linux")]
+fn execute_clipboard_write(text: &str) -> Result<ToolExecution, String> {
+    use std::process::Stdio;
+    if text.len() > 2_000 {
+        return Err("Clipboard text must be under 2000 characters.".to_string());
+    }
+    // Try wl-copy (Wayland) first.
+    let wl_result: std::io::Result<bool> = (|| {
+        let mut child = Command::new("wl-copy").stdin(Stdio::piped()).spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        Ok(child.wait()?.success())
+    })();
+    if wl_result.is_ok_and(|ok| ok) {
+        return Ok(ToolExecution {
+            tool: "write_clipboard".to_string(),
+            summary: format!("Copied {} character(s) to clipboard.", text.chars().count()),
+            data: json!({"written": true, "backend": "wl-copy"}),
+        });
+    }
+    // Fallback: xclip (X11).
+    let xclip_result: std::io::Result<bool> = (|| {
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        Ok(child.wait()?.success())
+    })();
+    match xclip_result {
+        Ok(true) => Ok(ToolExecution {
+            tool: "write_clipboard".to_string(),
+            summary: format!("Copied {} character(s) to clipboard.", text.chars().count()),
+            data: json!({"written": true, "backend": "xclip"}),
+        }),
+        _ => Err(
+            "Install wl-clipboard (Wayland) or xclip (X11) to write to the clipboard.".to_string(),
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_clipboard_write(_: &str) -> Result<ToolExecution, String> {
+    Err("Clipboard write is available in the Linux desktop build only.".to_string())
+}
+
+// ── Wi-Fi connect / disconnect prepare/execute ─────────────────────────────
+
+fn prepare_wifi_connect(params: &IntentParams) -> Result<String, String> {
+    let name = params
+        .network_name
+        .as_deref()
+        .ok_or_else(|| "A saved network name is required for Wi-Fi connect.".to_string())?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Network name cannot be empty.".to_string());
+    }
+    if !is_valid_network_name(name) {
+        return Err("Network name contains unsupported characters.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn wifi_connect_preview(name: &str) -> String {
+    format!("Connect to saved Wi-Fi network: {name}.")
+}
+
+fn prepare_wifi_disconnect(params: &IntentParams) -> Result<String, String> {
+    if let Some(name) = params.network_name.as_deref() {
+        let name = name.trim();
+        if !name.is_empty() && !is_valid_network_name(name) {
+            return Err("Network name contains unsupported characters.".to_string());
+        }
+        Ok(name.to_string())
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn wifi_disconnect_preview(name: &str) -> String {
+    if name.is_empty() {
+        "Disconnect from the current Wi-Fi network.".to_string()
+    } else {
+        format!("Disconnect from saved Wi-Fi network: {name}.")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_wifi_connect(name: &str) -> Result<ToolExecution, String> {
+    if !is_valid_network_name(name) {
+        return Err("Invalid network name.".to_string());
+    }
+    let output = Command::new("nmcli")
+        .args(["connection", "up", "id", name])
+        .output()
+        .map_err(|_| "Could not run nmcli. Check that NetworkManager is installed.".to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not connect to '{name}'. Verify it is a saved NetworkManager profile. \
+             Use 'show saved Wi-Fi networks' to list available profiles."
+        ));
+    }
+    Ok(ToolExecution {
+        tool: "wifi_connect".to_string(),
+        summary: format!("Connected to Wi-Fi network: {name}."),
+        data: json!({"connected": true, "network": name}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_wifi_connect(_: &str) -> Result<ToolExecution, String> {
+    Err("Wi-Fi control is available in the Linux desktop build only.".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn execute_wifi_disconnect(name: &str) -> Result<ToolExecution, String> {
+    let output = if name.is_empty() {
+        Command::new("nmcli")
+            .args(["device", "disconnect", "wifi"])
+            .output()
+            .map_err(|_| "Could not run nmcli.".to_string())?
+    } else {
+        if !is_valid_network_name(name) {
+            return Err("Invalid network name.".to_string());
+        }
+        Command::new("nmcli")
+            .args(["connection", "down", "id", name])
+            .output()
+            .map_err(|_| "Could not run nmcli.".to_string())?
+    };
+    if !output.status.success() {
+        return Err(
+            "Could not disconnect. The network may not be active or nmcli may be unavailable."
+                .to_string(),
+        );
+    }
+    let summary = if name.is_empty() {
+        "Disconnected from the current Wi-Fi network.".to_string()
+    } else {
+        format!("Disconnected from Wi-Fi network: {name}.")
+    };
+    Ok(ToolExecution {
+        tool: "wifi_disconnect".to_string(),
+        summary: summary.clone(),
+        data: json!({"disconnected": true, "network": if name.is_empty() { "current" } else { name }}),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_wifi_disconnect(_: &str) -> Result<ToolExecution, String> {
+    Err("Wi-Fi control is available in the Linux desktop build only.".to_string())
+}
+
 fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
     match intent.action {
         Action::SearchFiles => search_files(&intent.params),
@@ -2060,6 +2555,15 @@ fn execute_low_risk(intent: &Intent) -> Result<ToolExecution, String> {
         Action::ReadClipboard => read_clipboard(),
         Action::WindowControl => {
             Err("Window control must pass through the confirmation gate.".to_string())
+        }
+        Action::WriteClipboard => {
+            Err("Clipboard write must pass through the confirmation gate.".to_string())
+        }
+        Action::WifiConnect => {
+            Err("Wi-Fi connect must pass through the confirmation gate.".to_string())
+        }
+        Action::WifiDisconnect => {
+            Err("Wi-Fi disconnect must pass through the confirmation gate.".to_string())
         }
     }
 }
@@ -2193,6 +2697,21 @@ async fn process_request(
                         format!("{} window: {}.", command, name),
                     )
                 }
+                Action::WriteClipboard => {
+                    let text = prepare_clipboard_write(&intent.params)?;
+                    let preview = clipboard_write_preview(&text);
+                    (PendingOperation::WriteClipboard(text), preview)
+                }
+                Action::WifiConnect => {
+                    let name = prepare_wifi_connect(&intent.params)?;
+                    let preview = wifi_connect_preview(&name);
+                    (PendingOperation::WifiConnect(name), preview)
+                }
+                Action::WifiDisconnect => {
+                    let name = prepare_wifi_disconnect(&intent.params)?;
+                    let preview = wifi_disconnect_preview(&name);
+                    (PendingOperation::WifiDisconnect(name), preview)
+                }
                 _ => {
                     return Err(
                         "Unsupported confirmation operation. No action was taken.".to_string()
@@ -2295,6 +2814,9 @@ fn confirm_pending_action(
         PendingOperation::Notification(body) => execute_notification(body),
         PendingOperation::Screenshot => execute_screenshot(),
         PendingOperation::Window { command, name } => execute_window(command, name),
+        PendingOperation::WriteClipboard(text) => execute_clipboard_write(text),
+        PendingOperation::WifiConnect(name) => execute_wifi_connect(name),
+        PendingOperation::WifiDisconnect(name) => execute_wifi_disconnect(name),
     };
     match execution_result {
         Ok(mut execution) => {
@@ -2613,6 +3135,194 @@ fn deliver_due_reminders(app: AppHandle) -> Result<Vec<String>, String> {
     Ok(delivered)
 }
 
+// ── New Tauri commands ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ParsedReminder {
+    due_at: String,
+    message: String,
+}
+
+#[tauri::command]
+fn parse_reminder_text(text: String) -> Result<ParsedReminder, String> {
+    match parse_reminder_natural(&text) {
+        Some((due_at, message)) => Ok(ParsedReminder { due_at, message }),
+        None => Err(
+            "Could not parse that reminder. Try: \"remind me in 10 minutes to drink water\" \
+             or \"remind me tomorrow at 9 AM to submit assignment\"."
+                .to_string(),
+        ),
+    }
+}
+
+#[derive(Serialize)]
+struct WakeWordStatus {
+    enabled: bool,
+    summary: String,
+}
+
+#[tauri::command]
+fn get_wake_word_status() -> WakeWordStatus {
+    let enabled = env::var("WAKE_WORD_ENABLED")
+        .map(|v| v.trim().to_lowercase() == "true")
+        .unwrap_or(false);
+    WakeWordStatus {
+        enabled,
+        summary: if enabled {
+            "Wake-word listening is enabled via WAKE_WORD_ENABLED=true. \
+             Ensure you understand the privacy implications."
+                .to_string()
+        } else {
+            "Wake-word listening is disabled (default). \
+             Set WAKE_WORD_ENABLED=true in the systemd service to enable (requires whisper.cpp streaming)."
+                .to_string()
+        },
+    }
+}
+
+#[tauri::command]
+async fn get_installed_models() -> Result<Vec<String>, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "Could not initialize HTTP client.".to_string())?;
+    match client.get(OLLAMA_TAGS_URL).send().await {
+        Ok(response) if response.status().is_success() => {
+            let tags: OllamaTagsResponse = response
+                .json()
+                .await
+                .map_err(|_| "Could not parse Ollama model list.".to_string())?;
+            Ok(tags.models.into_iter().map(|m| m.name).collect())
+        }
+        _ => Err("Could not reach Ollama. Check that it is running on port 11434.".to_string()),
+    }
+}
+
+/// Save raw audio bytes (WebM/Ogg from MediaRecorder) to a temp file in the
+/// app data directory and return the absolute path.  The caller must delete
+/// the file after transcription.
+#[tauri::command]
+fn save_temp_audio(app: AppHandle, data: Vec<u8>) -> Result<String, String> {
+    if data.is_empty() || data.len() > 100_000_000 {
+        return Err("Audio data is empty or too large.".to_string());
+    }
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Could not locate the app data directory.".to_string())?;
+    fs::create_dir_all(&data_dir)
+        .map_err(|_| "Could not create the app data directory.".to_string())?;
+    let filename = format!("temp_audio_{}.webm", Utc::now().timestamp_millis());
+    let path = data_dir.join(&filename);
+    fs::write(&path, &data)
+        .map_err(|_| "Could not save the temporary audio file.".to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn get_whisper_model_path_internal(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let candidates = [
+        home.join(".local/share/whisper.cpp/models/ggml-base.en.bin"),
+        home.join("whisper.cpp/models/ggml-base.en.bin"),
+        home.join(".local/share/whisper.cpp/models/ggml-small.en.bin"),
+        home.join("whisper.cpp/models/ggml-small.en.bin"),
+        std::path::PathBuf::from("/usr/share/whisper-cpp/models/ggml-base.en.bin"),
+        std::path::PathBuf::from("/usr/local/share/whisper-cpp/models/ggml-base.en.bin"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+#[tauri::command]
+fn get_whisper_model_path() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        user_root()
+            .ok()
+            .and_then(|home| get_whisper_model_path_internal(&home))
+            .map(|p| p.to_string_lossy().to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn transcribe_audio(app: AppHandle, audio_path: String) -> Result<String, String> {
+    let audio_path_buf = std::path::PathBuf::from(&audio_path);
+    if !audio_path_buf.is_absolute() {
+        return Err("Audio path must be absolute.".to_string());
+    }
+    // Restrict to app data directory.
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Could not locate the app data directory.".to_string())?;
+    let canonical = fs::canonicalize(&audio_path_buf)
+        .map_err(|_| "Audio file does not exist or cannot be accessed.".to_string())?;
+    if !canonical.starts_with(&data_dir) {
+        return Err("Audio path must be within the app data directory.".to_string());
+    }
+    // Find whisper executable.
+    let whisper_bin = if executable_available("whisper-cli") {
+        "whisper-cli"
+    } else if executable_available("whisper-cpp") {
+        "whisper-cpp"
+    } else {
+        return Err(
+            "whisper.cpp is not installed. Install with: sudo apt install whisper-cpp\n\
+             Or build from source: https://github.com/ggerganov/whisper.cpp\n\
+             Then download a model: whisper-cli --download-model base.en"
+                .to_string(),
+        );
+    };
+    // Find a model.
+    let home = user_root().map_err(|_| "Could not locate home directory.".to_string())?;
+    let model_path = get_whisper_model_path_internal(&home).ok_or_else(|| {
+        "No whisper.cpp model found. Download one with:\n\
+         whisper-cli --download-model base.en\n\
+         or place ggml-base.en.bin in ~/.local/share/whisper.cpp/models/"
+            .to_string()
+    })?;
+    let output = Command::new(whisper_bin)
+        .args([
+            "--model",
+            model_path.to_string_lossy().as_ref(),
+            "--file",
+            audio_path_buf.to_string_lossy().as_ref(),
+            "--output-txt",
+            "--no-prints",
+        ])
+        .output()
+        .map_err(|_| {
+            "Could not run whisper. Check that whisper.cpp is properly installed.".to_string()
+        })?;
+    // Clean up the temp file regardless of outcome.
+    let _ = fs::remove_file(&audio_path_buf);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Transcription failed: {}",
+            stderr.chars().take(300).collect::<String>()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .chars()
+        .take(4_000)
+        .collect::<String>();
+    if text.is_empty() {
+        return Err(
+            "Transcription produced no text. Speak clearly or check microphone input.".to_string(),
+        );
+    }
+    Ok(text)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+fn transcribe_audio(_app: AppHandle, _audio_path: String) -> Result<String, String> {
+    Err("Voice transcription is available in the Linux desktop build only.".to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -2640,7 +3350,13 @@ fn main() {
             get_reminders,
             complete_reminder,
             delete_reminder,
-            deliver_due_reminders
+            deliver_due_reminders,
+            parse_reminder_text,
+            get_wake_word_status,
+            get_installed_models,
+            save_temp_audio,
+            transcribe_audio,
+            get_whisper_model_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");
@@ -2911,5 +3627,122 @@ mod tests {
     fn network_parser_handles_colons_in_an_ssid() {
         let status = parse_network_status("yes:home\\:lab:78");
         assert_eq!(status, (true, Some("home:lab".to_string()), Some(78)));
+    }
+
+    #[test]
+    fn clipboard_write_parser_extracts_text() {
+        let intent = local_clipboard_write_request("copy hello world to clipboard")
+            .expect("should parse clipboard write");
+        assert!(matches!(intent.action, Action::WriteClipboard));
+        assert_eq!(intent.params.clipboard_text.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn clipboard_write_parser_handles_set_clipboard_prefix() {
+        let intent = local_clipboard_write_request("set clipboard to my text")
+            .expect("should parse set-clipboard");
+        assert_eq!(intent.params.clipboard_text.as_deref(), Some("my text"));
+    }
+
+    #[test]
+    fn clipboard_write_parser_rejects_empty_text() {
+        assert!(local_clipboard_write_request("copy to clipboard").is_none());
+    }
+
+    #[test]
+    fn clipboard_write_planner_assigns_medium_risk() {
+        let result = plan_intent(&intent(
+            Action::WriteClipboard,
+            IntentParams {
+                clipboard_text: Some("hello".to_string()),
+                ..Default::default()
+            },
+            RiskTier::Medium,
+        ));
+        assert!(matches!(result, Ok(RiskTier::Medium)));
+    }
+
+    #[test]
+    fn wifi_connect_parser_extracts_network_name() {
+        let intent = local_wifi_connect_request("connect to wifi HomeNetwork")
+            .expect("should parse wifi connect");
+        assert!(matches!(intent.action, Action::WifiConnect));
+        assert_eq!(intent.params.network_name.as_deref(), Some("HomeNetwork"));
+    }
+
+    #[test]
+    fn wifi_connect_parser_handles_join_prefix() {
+        let intent = local_wifi_connect_request("join wifi OfficeWifi")
+            .expect("should parse join wifi");
+        assert_eq!(intent.params.network_name.as_deref(), Some("OfficeWifi"));
+    }
+
+    #[test]
+    fn wifi_disconnect_parser_extracts_network_name() {
+        let intent = local_wifi_disconnect_request("disconnect from wifi HomeNetwork")
+            .expect("should parse wifi disconnect");
+        assert!(matches!(intent.action, Action::WifiDisconnect));
+        assert_eq!(intent.params.network_name.as_deref(), Some("HomeNetwork"));
+    }
+
+    #[test]
+    fn is_valid_network_name_rejects_shell_injection() {
+        assert!(!is_valid_network_name("net; rm -rf /"));
+        assert!(!is_valid_network_name(""));
+        assert!(is_valid_network_name("Home-Wifi_5G"));
+    }
+
+    #[test]
+    fn reminder_parser_handles_minutes() {
+        let result = parse_reminder_natural("remind me in 10 minutes to drink water");
+        assert!(result.is_some());
+        let (_, msg) = result.unwrap();
+        assert_eq!(msg, "drink water");
+    }
+
+    #[test]
+    fn reminder_parser_handles_hours() {
+        let result = parse_reminder_natural("remind me in 2 hours to exercise");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn reminder_parser_handles_tomorrow_with_default_time() {
+        let result = parse_reminder_natural("remind me tomorrow to call Alice");
+        assert!(result.is_some());
+        let (due, msg) = result.unwrap();
+        assert_eq!(msg, "call Alice");
+        assert!(due.contains("T09:00"));
+    }
+
+    #[test]
+    fn reminder_parser_handles_at_time() {
+        let result = parse_reminder_natural("remind me at 3pm to take medicine");
+        assert!(result.is_some());
+        let (due, msg) = result.unwrap();
+        assert_eq!(msg, "take medicine");
+        assert!(due.contains("T15:00"));
+    }
+
+    #[test]
+    fn reminder_parser_returns_none_for_ambiguous_input() {
+        assert!(parse_reminder_natural("remind me sometime").is_none());
+        assert!(parse_reminder_natural("set an alarm").is_none());
+    }
+
+    #[test]
+    fn parse_time_str_handles_am_pm() {
+        assert_eq!(
+            parse_time_str("9am"),
+            NaiveTime::from_hms_opt(9, 0, 0)
+        );
+        assert_eq!(
+            parse_time_str("11:30 pm"),
+            NaiveTime::from_hms_opt(23, 30, 0)
+        );
+        assert_eq!(
+            parse_time_str("12 am"),
+            NaiveTime::from_hms_opt(0, 0, 0)
+        );
     }
 }

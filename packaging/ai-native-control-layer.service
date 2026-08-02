@@ -1,13 +1,28 @@
 [Unit]
-Description=Linux Assistant desktop overlay
+Description=AI Native Control Layer desktop overlay
+Documentation=https://github.com/skartik06/ai-native-control-layer
 PartOf=graphical-session.target
-After=graphical-session.target
+After=graphical-session.target ollama.service
+Wants=ollama.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/ai-native-control-layer
 Restart=on-failure
 RestartSec=3
+
+# ── Optional feature flags ──────────────────────────────────────────────────
+# Set WAKE_WORD_ENABLED=true to enable always-on wake-word detection.
+# Requires whisper.cpp streaming binary (whisper-stream) to be on PATH.
+# OFF by default because of privacy and CPU-usage implications.
+# Environment=WAKE_WORD_ENABLED=true
+
+# Override the Ollama model used for intent parsing.
+# Must be a saved Ollama model: `ollama list`.
+# Environment=OLLAMA_MODEL=qwen3:4b-instruct
+
+# Set a longer Ollama timeout (milliseconds) on slower hardware.
+# Environment=OLLAMA_TIMEOUT_MS=60000
 
 [Install]
 WantedBy=default.target

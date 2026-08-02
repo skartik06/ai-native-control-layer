@@ -2,144 +2,151 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
-const shortcut = "CommandOrControl+Space";
+const SHORTCUT = "CommandOrControl+Space";
 const isTauri = "__TAURI_INTERNALS__" in window;
 
-type IntentResult = {
-  clarification_needed: boolean;
-  clarification_question: string | null;
-};
+// ── Types ──────────────────────────────────────────────────────────────────────
 
-type ProcessResult = {
-  intent: IntentResult;
-  execution: unknown | null;
-  message: string;
-  confirmation: ConfirmationPreview | null;
-};
-
-type ConfirmationPreview = {
-  summary: string;
-  expires_in_seconds: number;
-};
-
-type ToolExecution = {
-  tool: string;
-  summary: string;
-  data: unknown;
-};
-
-type AuditEntry = {
-  id: number;
-  timestamp: string;
-  action: string;
-  outcome: string;
-  summary: string;
-};
-
-type RuntimeProfile = {
-  profile: string;
-  total_memory_gb: number;
-  cpu_cores: number;
-  summary: string;
-};
-
-type MemoryEntry = {
-  id: number;
-  created_at: string;
-  category: string;
-  memory_key: string;
-  value: string;
-};
-
-type VoiceStatus = {
-  text_to_speech_available: boolean;
-  speech_to_text_available: boolean;
-  summary: string;
-};
-
+type IntentResult = { clarification_needed: boolean; clarification_question: string | null };
+type ConfirmationPreview = { summary: string; expires_in_seconds: number };
+type ProcessResult = { intent: IntentResult; execution: unknown | null; message: string; confirmation: ConfirmationPreview | null };
+type ToolExecution = { tool: string; summary: string; data: unknown };
+type AuditEntry = { id: number; timestamp: string; action: string; outcome: string; summary: string };
+type RuntimeProfile = { profile: string; total_memory_gb: number; cpu_cores: number; summary: string };
+type MemoryEntry = { id: number; created_at: string; category: string; memory_key: string; value: string };
+type VoiceStatus = { text_to_speech_available: boolean; speech_to_text_available: boolean; summary: string };
 type ChatEntry = { id: number; created_at: string; role: string; content: string };
+type ReminderEntry = { id: number; created_at: string; due_at: string; message: string; completed: boolean };
+type ParsedReminder = { due_at: string; message: string };
+type WakeWordStatus = { enabled: boolean; summary: string };
 
 function readableError(error: unknown) {
-  return String(error).replace(/^Error:\s*/, "");
+  return String(error).replace(/^Error:\s*/, "").replace(/^tauri::\S+\s*/, "");
 }
 
+function formatDue(isoString: string): string {
+  try { return new Date(isoString).toLocaleString(); } catch { return isoString; }
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────────
+
 function App() {
+  // Core
   const [input, setInput] = useState("");
   const [response, setResponse] = useState("");
   const [loading, setLoading] = useState(false);
   const [confirmation, setConfirmation] = useState<ConfirmationPreview | null>(null);
+  const [mode, setMode] = useState<"control" | "chat">("control");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Profile & voice
+  const [runtimeProfile, setRuntimeProfile] = useState<RuntimeProfile | null>(null);
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
+  const [wakeWordStatus, setWakeWordStatus] = useState<WakeWordStatus | null>(null);
+  const [installedModels, setInstalledModels] = useState<string[] | null>(null);
+
+  // Panels visibility
+  const [showHistory, setShowHistory] = useState(false);
+  const [showChatHistory, setShowChatHistory] = useState(false);
+  const [showMemory, setShowMemory] = useState(false);
+  const [showReminders, setShowReminders] = useState(false);
+  const [showNetworks, setShowNetworks] = useState(false);
+
+  // Audit history
   const [history, setHistory] = useState<AuditEntry[] | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [runtimeProfile, setRuntimeProfile] = useState<RuntimeProfile | null>(null);
+
+  // Chat history
+  const [chatHistory, setChatHistory] = useState<ChatEntry[] | null>(null);
+
+  // Memory
   const [memory, setMemory] = useState<MemoryEntry[] | null>(null);
   const [memoryKey, setMemoryKey] = useState("");
   const [memoryValue, setMemoryValue] = useState("");
-  const [mode, setMode] = useState<"control" | "chat">("control");
-  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
-  const [chatHistory, setChatHistory] = useState<ChatEntry[] | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Reminders
+  const [reminders, setReminders] = useState<ReminderEntry[] | null>(null);
+  const [reminderMsg, setReminderMsg] = useState("");
+  const [reminderDue, setReminderDue] = useState("");
+  const [nlReminderText, setNlReminderText] = useState("");
+  const [nlParsed, setNlParsed] = useState<ParsedReminder | null>(null);
+  const [nlError, setNlError] = useState("");
+  const [reminderLoading, setReminderLoading] = useState(false);
+
+  // Networks
+  const [savedNetworks, setSavedNetworks] = useState<string[] | null>(null);
+  const [networksLoading, setNetworksLoading] = useState(false);
+
+  // Push-to-talk
+  const [pttActive, setPttActive] = useState(false);
+  const [pttLoading, setPttLoading] = useState(false);
+  const pttRef = useRef<MediaRecorder | null>(null);
+  const pttChunksRef = useRef<Blob[]>([]);
+
+  // ── Bootstrap ──────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!isTauri) return;
-    const setupShortcut = async () => {
+    const setup = async () => {
       const [{ getCurrentWindow }, { register }] = await Promise.all([
-        import("@tauri-apps/api/window"), import("@tauri-apps/plugin-global-shortcut")
+        import("@tauri-apps/api/window"),
+        import("@tauri-apps/plugin-global-shortcut"),
       ]);
-      const appWindow = getCurrentWindow();
-      await register(shortcut, async (event) => {
-        if (event.state !== "Pressed") return;
-        if (await appWindow.isVisible()) await appWindow.hide();
-        else { await appWindow.show(); await appWindow.setFocus(); inputRef.current?.focus(); }
+      const win = getCurrentWindow();
+      await register(SHORTCUT, async (e) => {
+        if (e.state !== "Pressed") return;
+        if (await win.isVisible()) await win.hide();
+        else { await win.show(); await win.setFocus(); inputRef.current?.focus(); }
       });
     };
-    void setupShortcut();
-    return () => { void import("@tauri-apps/plugin-global-shortcut").then(({ unregister }) => unregister(shortcut)); };
+    void setup();
+    return () => {
+      void import("@tauri-apps/plugin-global-shortcut").then(({ unregister }) => unregister(SHORTCUT));
+    };
   }, []);
 
   useEffect(() => {
     if (!isTauri) return;
-    void import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke<RuntimeProfile>("get_runtime_profile"))
-      .then(setRuntimeProfile)
-      .catch(() => setRuntimeProfile(null));
+    import("@tauri-apps/api/core").then(({ invoke }) => {
+      void invoke<RuntimeProfile>("get_runtime_profile").then(setRuntimeProfile).catch(() => {});
+      void invoke<VoiceStatus>("get_voice_status").then(setVoiceStatus).catch(() => {});
+      void invoke<WakeWordStatus>("get_wake_word_status").then(setWakeWordStatus).catch(() => {});
+      void invoke<string[]>("get_installed_models").then(setInstalledModels).catch(() => {});
+    });
   }, []);
 
   useEffect(() => {
-    if (!isTauri) return;
-    void import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke<VoiceStatus>("get_voice_status"))
-      .then(setVoiceStatus)
-      .catch(() => setVoiceStatus(null));
-  }, []);
-
-  useEffect(() => {
-    const onEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && isTauri) void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => getCurrentWindow().hide());
+    const onEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && isTauri) {
+        void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => getCurrentWindow().hide());
+      }
     };
     window.addEventListener("keydown", onEscape);
     return () => window.removeEventListener("keydown", onEscape);
   }, []);
 
+  // Reminder delivery check every 60 s
   useEffect(() => {
     if (!isTauri) return;
-    const check = async () => {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke<string[]>("deliver_due_reminders");
-    };
+    const check = () =>
+      import("@tauri-apps/api/core").then(({ invoke }) => invoke<string[]>("deliver_due_reminders"));
     void check();
-    const timer = window.setInterval(() => void check(), 60_000);
-    return () => window.clearInterval(timer);
+    const t = window.setInterval(() => void check(), 60_000);
+    return () => window.clearInterval(t);
   }, []);
+
+  // ── Command submit ─────────────────────────────────────────────────────────
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     const request = input.trim();
     if (!request || confirmation) return;
     if (!isTauri) {
-      setResponse("Intent parsing requires the native app plus a local Ollama model. Start it with `pnpm tauri dev` after running `ollama run qwen3:4b`.");
+      setResponse("Intent parsing requires the native app plus a local Ollama model. Start with `pnpm tauri dev` after running `ollama run qwen3:4b`.");
       return;
     }
-    setLoading(true); setResponse("");
+    setLoading(true);
+    setResponse("");
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       if (mode === "chat") {
@@ -152,14 +159,18 @@ function App() {
         setConfirmation(result.confirmation);
         setResponse(result.message);
       } else {
-        setResponse(result.intent.clarification_needed
-          ? `Clarification needed: ${result.message}`
-          : `${result.message}\n\n${JSON.stringify(result.execution, null, 2)}`);
+        setResponse(
+          result.intent.clarification_needed
+            ? `Clarification needed: ${result.message}`
+            : `${result.message}\n\n${JSON.stringify(result.execution, null, 2)}`
+        );
       }
       setInput("");
     } catch (error) {
       setResponse(`Request could not be completed. ${readableError(error)}`);
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function stopCurrentRequest() {
@@ -177,13 +188,13 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const status = await invoke<string>("speak_text", { text: response });
-      setResponse((current) => `${current}\n\n${status}`);
+      setResponse((r) => `${r}\n\n${status}`);
     } catch (error) {
-      setResponse((current) => `${current}\n\nVoice output unavailable: ${readableError(error)}`);
+      setResponse((r) => `${r}\n\nVoice output unavailable: ${readableError(error)}`);
     }
   }
 
-  async function confirm() {
+  async function confirmAction() {
     if (!isTauri || !confirmation) return;
     setLoading(true);
     try {
@@ -192,26 +203,79 @@ function App() {
       setResponse(`${result.summary}\n\n${JSON.stringify(result.data, null, 2)}`);
       setConfirmation(null);
     } catch (error) {
-      setResponse(`Setting was not changed: ${String(error)}`);
+      setResponse(`Action not performed: ${String(error)}`);
       setConfirmation(null);
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
+  async function cancelAction() {
+    if (!isTauri || !confirmation) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setResponse(await invoke<string>("cancel_pending_action"));
+    } catch (error) {
+      setResponse(`Could not cancel: ${String(error)}`);
+    } finally {
+      setConfirmation(null);
+    }
+  }
+
+  // ── Push-to-talk ───────────────────────────────────────────────────────────
+
+  async function startPTT() {
+    if (!isTauri || !voiceStatus?.speech_to_text_available) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      pttChunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) pttChunksRef.current.push(e.data); };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(pttChunksRef.current, { type: "audio/webm" });
+        const buf = await blob.arrayBuffer();
+        const data = Array.from(new Uint8Array(buf));
+        setPttLoading(true);
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const audioPath = await invoke<string>("save_temp_audio", { data });
+          const text = await invoke<string>("transcribe_audio", { audioPath });
+          setInput(text.trim());
+          inputRef.current?.focus();
+        } catch (error) {
+          setResponse(`Voice transcription failed: ${readableError(error)}`);
+        } finally {
+          setPttLoading(false);
+          setPttActive(false);
+        }
+      };
+      recorder.start();
+      pttRef.current = recorder;
+      setPttActive(true);
+    } catch (error) {
+      setResponse(`Microphone access failed: ${readableError(error)}`);
+    }
+  }
+
+  function stopPTT() {
+    if (pttRef.current && pttRef.current.state !== "inactive") {
+      pttRef.current.stop();
+    }
+  }
+
+  // ── History ────────────────────────────────────────────────────────────────
+
   async function toggleHistory() {
-    if (!isTauri) {
-      setResponse("Audit history is available in the native desktop app.");
-      return;
-    }
-    if (history) {
-      setHistory(null);
-      return;
-    }
+    if (!isTauri) { setResponse("Audit history is available in the native desktop app."); return; }
+    if (showHistory) { setShowHistory(false); setHistory(null); return; }
     setHistoryLoading(true);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       setHistory(await invoke<AuditEntry[]>("get_audit_history", { limit: 20 }));
+      setShowHistory(true);
     } catch (error) {
-      setResponse(`Could not load audit history: ${String(error)}`);
+      setResponse(`Could not load audit history: ${readableError(error)}`);
     } finally {
       setHistoryLoading(false);
     }
@@ -219,11 +283,14 @@ function App() {
 
   async function toggleChatHistory() {
     if (!isTauri) return;
-    if (chatHistory) { setChatHistory(null); return; }
+    if (showChatHistory) { setShowChatHistory(false); setChatHistory(null); return; }
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       setChatHistory(await invoke<ChatEntry[]>("get_chat_history", { limit: 50 }));
-    } catch (error) { setResponse(`Could not load chat history. ${readableError(error)}`); }
+      setShowChatHistory(true);
+    } catch (error) {
+      setResponse(`Could not load chat history. ${readableError(error)}`);
+    }
   }
 
   async function clearChatHistory() {
@@ -233,25 +300,18 @@ function App() {
     setChatHistory([]);
   }
 
-  async function cancel() {
-    if (!isTauri || !confirmation) return;
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      setResponse(await invoke<string>("cancel_pending_action"));
-    } catch (error) {
-      setResponse(`Could not cancel pending action: ${String(error)}`);
-    } finally {
-      setConfirmation(null);
-    }
-  }
+  // ── Memory ─────────────────────────────────────────────────────────────────
 
   async function toggleMemory() {
     if (!isTauri) return;
-    if (memory) { setMemory(null); return; }
+    if (showMemory) { setShowMemory(false); setMemory(null); return; }
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       setMemory(await invoke<MemoryEntry[]>("get_memory"));
-    } catch (error) { setResponse(`Could not load memory. ${readableError(error)}`); }
+      setShowMemory(true);
+    } catch (error) {
+      setResponse(`Could not load memory. ${readableError(error)}`);
+    }
   }
 
   async function saveMemory(event: FormEvent) {
@@ -259,17 +319,21 @@ function App() {
     if (!isTauri || !memoryKey.trim() || !memoryValue.trim()) return;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const entry = await invoke<MemoryEntry>("remember_preference", { category: "preference", memoryKey, value: memoryValue });
-      setMemory((current) => current ? [entry, ...current] : [entry]);
+      const entry = await invoke<MemoryEntry>("remember_preference", {
+        category: "preference", memoryKey, value: memoryValue,
+      });
+      setMemory((cur) => (cur ? [entry, ...cur] : [entry]));
       setMemoryKey(""); setMemoryValue("");
-    } catch (error) { setResponse(`Could not save memory. ${readableError(error)}`); }
+    } catch (error) {
+      setResponse(`Could not save memory. ${readableError(error)}`);
+    }
   }
 
   async function removeMemory(id: number) {
     if (!isTauri) return;
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("forget_memory", { id });
-    setMemory((current) => current?.filter((entry) => entry.id !== id) ?? null);
+    setMemory((cur) => cur?.filter((e) => e.id !== id) ?? null);
   }
 
   async function clearMemory() {
@@ -279,46 +343,449 @@ function App() {
     setMemory([]);
   }
 
-  return <main className="overlay-shell">
-    <section className="command-palette" aria-label="AI Native Control Layer">
-      <div className="brand-row"><span className="status-dot" aria-hidden="true" /><span>LINUX ASSISTANT</span><span className="profile-badge">{runtimeProfile ? `${runtimeProfile.profile.toUpperCase()} PROFILE · ALPHA` : "CHECKING PROFILE"}</span><button className="history-toggle" type="button" onClick={toggleMemory}>Memory</button><button className="history-toggle" type="button" onClick={toggleHistory} disabled={historyLoading}>{historyLoading ? "Loading..." : history ? "Close history" : "History"}</button>{loading && <button className="stop-button" type="button" onClick={stopCurrentRequest}>Stop</button>}<kbd>Ctrl Space</kbd></div>
-      <section className="assistant-intro">
-        <p className="eyebrow">PRIVATE · LOCAL-FIRST · SAFETY-GATED</p>
-        <h1>What can I help you do?</h1>
-        <p>Control your Linux desktop, inspect your system, and safely launch supported apps. Your latest response can be spoken when a Linux speech engine is installed.</p>
-        {runtimeProfile && <p className="runtime-summary">{runtimeProfile.summary} Detected: {runtimeProfile.total_memory_gb} GB RAM · {runtimeProfile.cpu_cores} CPU cores.</p>}
-        <div className="capability-row"><button className={mode === "control" ? "mode-active" : ""} type="button" onClick={() => setMode("control")}>Control mode</button><button className={mode === "chat" ? "mode-active" : ""} type="button" onClick={() => setMode("chat")}>Chat mode</button><button type="button" onClick={toggleChatHistory}>{chatHistory ? "Close chats" : "Chats"}</button><span>System health</span><span>Files</span><span>Apps</span><span>Settings</span><span title={voiceStatus?.summary}>{voiceStatus?.text_to_speech_available ? "Voice output ready" : "Voice output setup needed"}</span></div>
-      </section>
-      <form onSubmit={submit}>
-        <input ref={inputRef} autoFocus value={input} onChange={(event) => setInput(event.target.value)} disabled={loading || Boolean(confirmation)}
-          placeholder={mode === "chat" ? "Ask a general question (uses your local model)" : "Try: open file manager, show Wi-Fi status, or turn on dark mode"} aria-label="Command input" />
-      </form>
-      {confirmation && <section className="confirmation" aria-label="Confirm setting change">
-        <p>Preview: {confirmation.summary}</p>
-        <small>This expires in {confirmation.expires_in_seconds} seconds.</small>
-        <div className="confirmation-actions">
-          <button type="button" onClick={cancel} disabled={loading}>Cancel</button>
-          <button type="button" className="confirm" onClick={confirm} disabled={loading}>Confirm change</button>
+  // ── Reminders ──────────────────────────────────────────────────────────────
+
+  async function toggleReminders() {
+    if (!isTauri) return;
+    if (showReminders) { setShowReminders(false); setReminders(null); return; }
+    setReminderLoading(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setReminders(await invoke<ReminderEntry[]>("get_reminders"));
+      setShowReminders(true);
+    } catch (error) {
+      setResponse(`Could not load reminders. ${readableError(error)}`);
+    } finally {
+      setReminderLoading(false);
+    }
+  }
+
+  async function parseNlReminder() {
+    if (!isTauri || !nlReminderText.trim()) return;
+    setNlError("");
+    setNlParsed(null);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const parsed = await invoke<ParsedReminder>("parse_reminder_text", { text: nlReminderText });
+      setNlParsed(parsed);
+      setReminderDue(parsed.due_at.slice(0, 16)); // datetime-local format
+      setReminderMsg(parsed.message);
+    } catch (error) {
+      setNlError(readableError(error));
+    }
+  }
+
+  async function addReminder(event: FormEvent) {
+    event.preventDefault();
+    if (!isTauri || !reminderMsg.trim() || !reminderDue) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      // Convert datetime-local to RFC3339
+      const dueAt = new Date(reminderDue).toISOString();
+      const entry = await invoke<ReminderEntry>("create_reminder", { dueAt, message: reminderMsg.trim() });
+      setReminders((cur) => (cur ? [entry, ...cur] : [entry]));
+      setReminderMsg(""); setReminderDue(""); setNlParsed(null); setNlReminderText("");
+    } catch (error) {
+      setResponse(`Could not save reminder. ${readableError(error)}`);
+    }
+  }
+
+  async function completeReminder(id: number) {
+    if (!isTauri) return;
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("complete_reminder", { id });
+    setReminders((cur) => cur?.map((r) => r.id === id ? { ...r, completed: true } : r) ?? null);
+  }
+
+  async function deleteReminder(id: number) {
+    if (!isTauri) return;
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("delete_reminder", { id });
+    setReminders((cur) => cur?.filter((r) => r.id !== id) ?? null);
+  }
+
+  // ── Networks ───────────────────────────────────────────────────────────────
+
+  async function toggleNetworks() {
+    if (!isTauri) return;
+    if (showNetworks) { setShowNetworks(false); setSavedNetworks(null); return; }
+    setNetworksLoading(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setSavedNetworks(await invoke<string[]>("get_saved_networks"));
+      setShowNetworks(true);
+    } catch (error) {
+      setResponse(`Could not load saved networks. ${readableError(error)}`);
+    } finally {
+      setNetworksLoading(false);
+    }
+  }
+
+  async function connectToNetwork(name: string) {
+    if (!isTauri) return;
+    setResponse(`Requesting connection to ${name}…`);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<ProcessResult>("process_request", {
+        request: `connect to wifi ${name}`,
+      });
+      if (result.confirmation) {
+        setConfirmation(result.confirmation);
+        setResponse(result.message);
+      } else {
+        setResponse(result.message);
+      }
+    } catch (error) {
+      setResponse(`Wi-Fi connect failed: ${readableError(error)}`);
+    }
+  }
+
+  async function disconnectFromNetwork(name: string) {
+    if (!isTauri) return;
+    setResponse(`Requesting disconnect from ${name}…`);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<ProcessResult>("process_request", {
+        request: `disconnect from wifi ${name}`,
+      });
+      if (result.confirmation) {
+        setConfirmation(result.confirmation);
+        setResponse(result.message);
+      } else {
+        setResponse(result.message);
+      }
+    } catch (error) {
+      setResponse(`Wi-Fi disconnect failed: ${readableError(error)}`);
+    }
+  }
+
+  // ── Render helpers ─────────────────────────────────────────────────────────
+
+  const pttAvailable = isTauri && voiceStatus?.speech_to_text_available;
+  const pttLabel = pttLoading ? "…" : pttActive ? "⏹ Stop" : "🎙 Speak";
+
+  const modelLabel = installedModels
+    ? installedModels.length > 0 ? installedModels[0] : "No model"
+    : "Ollama?";
+
+  // ── JSX ────────────────────────────────────────────────────────────────────
+
+  return (
+    <main className="overlay-shell">
+      <section className="command-palette" aria-label="AI Native Control Layer">
+
+        {/* ── Top bar ── */}
+        <div className="brand-row">
+          <span className="status-dot" aria-hidden="true" />
+          <span className="brand-name">LINUX ASSISTANT</span>
+          <span className="profile-badge">
+            {runtimeProfile ? `${runtimeProfile.profile.toUpperCase()} · ${modelLabel}` : "Initialising…"}
+          </span>
+          <div className="brand-actions">
+            <button className={`panel-toggle ${showMemory ? "active" : ""}`} type="button" onClick={toggleMemory}>Memory</button>
+            <button className={`panel-toggle ${showReminders ? "active" : ""}`} type="button" onClick={toggleReminders} disabled={reminderLoading}>Reminders</button>
+            <button className={`panel-toggle ${showNetworks ? "active" : ""}`} type="button" onClick={toggleNetworks} disabled={networksLoading}>Networks</button>
+            <button className={`panel-toggle ${showHistory ? "active" : ""}`} type="button" onClick={toggleHistory} disabled={historyLoading}>History</button>
+            {loading && <button className="stop-button" type="button" onClick={stopCurrentRequest}>⏹ Stop</button>}
+            <kbd title="Toggle window">Ctrl Space</kbd>
+          </div>
         </div>
-      </section>}
-      {response && <><div className="response-tools"><button type="button" onClick={speakLatestResponse} disabled={!voiceStatus?.text_to_speech_available}>Speak response</button></div><pre className="response" role="status">{response}</pre></>}
-      {chatHistory && <section className="audit-history" aria-label="Local chat history"><div className="audit-heading"><strong>Local chat history</strong><button type="button" onClick={clearChatHistory}>Delete all</button></div>{chatHistory.length === 0 ? <p className="empty-history">No saved chat messages.</p> : <ul>{chatHistory.map((entry) => <li key={entry.id}><div><code>{entry.role}</code><time>{new Date(entry.created_at).toLocaleString()}</time></div><p>{entry.content}</p></li>)}</ul>}</section>}
-      {history && <section className="audit-history" aria-label="Local audit history">
-        <div className="audit-heading"><strong>Local audit history</strong><span>Latest {history.length} events</span></div>
-        {history.length === 0 ? <p className="empty-history">No events recorded yet.</p> : <ul>{history.map((entry) => <li key={entry.id}>
-          <div><span className={`outcome outcome-${entry.outcome}`}>{entry.outcome.replace(/_/g, " ")}</span><code>{entry.action}</code></div>
-          <p>{entry.summary}</p><time>{new Date(entry.timestamp).toLocaleString()}</time>
-        </li>)}</ul>}
-      </section>}
-      {memory && <section className="memory-panel" aria-label="Opt-in assistant memory">
-        <div className="audit-heading"><strong>Private assistant memory</strong><button type="button" onClick={clearMemory}>Delete all</button></div>
-        <p>Only save details you explicitly choose. Nothing is remembered automatically.</p>
-        <form className="memory-form" onSubmit={saveMemory}><input value={memoryKey} onChange={(event) => setMemoryKey(event.target.value)} placeholder="Preference, e.g. preferred browser" /><input value={memoryValue} onChange={(event) => setMemoryValue(event.target.value)} placeholder="Value, e.g. Firefox" /><button type="submit">Save memory</button></form>
-        {memory.length === 0 ? <p className="empty-history">No saved memories.</p> : <ul>{memory.map((entry) => <li key={entry.id}><div><code>{entry.memory_key}</code><button type="button" onClick={() => void removeMemory(entry.id)}>Forget</button></div><p>{entry.value}</p></li>)}</ul>}
-      </section>}
-      <p className="hint">{loading ? "Working — use Stop to cancel a waiting Ollama request." : mode === "chat" ? "Chat never performs system actions. Switch to Control mode for computer tasks." : confirmation ? "Nothing changes until you confirm." : "Read-only checks run automatically. App launches and settings need confirmation."}</p>
-    </section>
-  </main>;
+
+        {/* ── Intro ── */}
+        <section className="assistant-intro">
+          <p className="eyebrow">PRIVATE · LOCAL-FIRST · SAFETY-GATED</p>
+          <h1>What can I help you do?</h1>
+          {runtimeProfile && (
+            <p className="runtime-summary">
+              {runtimeProfile.summary} — {runtimeProfile.total_memory_gb} GB RAM · {runtimeProfile.cpu_cores} CPU cores
+            </p>
+          )}
+
+          {/* Mode tabs */}
+          <div className="mode-tabs">
+            <button
+              id="mode-control"
+              className={`mode-tab ${mode === "control" ? "mode-tab-active" : ""}`}
+              type="button"
+              onClick={() => setMode("control")}
+            >
+              🖥 Control
+            </button>
+            <button
+              id="mode-chat"
+              className={`mode-tab ${mode === "chat" ? "mode-tab-active" : ""}`}
+              type="button"
+              onClick={() => setMode("chat")}
+            >
+              💬 Chat
+            </button>
+            <button className="mode-tab" type="button" onClick={toggleChatHistory}>
+              {showChatHistory ? "Close chats" : "Chats"}
+            </button>
+          </div>
+
+          {/* Capability row */}
+          <div className="capability-row">
+            <span className={`cap-badge ${voiceStatus?.text_to_speech_available ? "cap-ok" : "cap-warn"}`}
+              title={voiceStatus?.summary}>
+              {voiceStatus?.text_to_speech_available ? "🔊 TTS ready" : "🔇 TTS setup needed"}
+            </span>
+            <span className={`cap-badge ${voiceStatus?.speech_to_text_available ? "cap-ok" : "cap-warn"}`}
+              title="Install whisper.cpp for voice input">
+              {voiceStatus?.speech_to_text_available ? "🎙 STT ready" : "🎙 STT setup needed"}
+            </span>
+            <span className={`cap-badge ${wakeWordStatus?.enabled ? "cap-warn" : "cap-ok"}`}
+              title={wakeWordStatus?.summary}>
+              {wakeWordStatus?.enabled ? "👂 Wake-word ON" : "Wake-word off"}
+            </span>
+            <span className="cap-badge cap-ok" title="System health, files, and read-only queries">📊 System · Files</span>
+            <span className="cap-badge cap-ok" title="Media controls via playerctl">🎵 Media</span>
+            <span className="cap-badge cap-ok" title="Dark mode, brightness, volume, Wi-Fi">⚙ Settings</span>
+          </div>
+        </section>
+
+        {/* ── Input form ── */}
+        <form className="input-form" onSubmit={submit}>
+          <input
+            ref={inputRef}
+            autoFocus
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={loading || Boolean(confirmation) || pttLoading}
+            placeholder={
+              pttLoading ? "Transcribing…" :
+              mode === "chat"
+                ? "Ask a general question (uses your local model)"
+                : "Try: copy hello to clipboard · connect to wifi Home · remind me in 10 min to stretch"
+            }
+            aria-label="Command input"
+          />
+          {pttAvailable && (
+            <button
+              id="ptt-button"
+              className={`ptt-button ${pttActive ? "ptt-active" : ""} ${pttLoading ? "ptt-loading" : ""}`}
+              type="button"
+              onClick={pttActive ? stopPTT : startPTT}
+              disabled={pttLoading || Boolean(confirmation)}
+              title={pttActive ? "Stop recording and transcribe" : "Hold to speak (requires whisper.cpp)"}
+              aria-label={pttActive ? "Stop recording" : "Start voice input"}
+            >
+              {pttLabel}
+            </button>
+          )}
+        </form>
+
+        {/* ── Confirmation gate ── */}
+        {confirmation && (
+          <section className="confirmation" aria-label="Confirm action">
+            <div className="confirmation-preview">
+              <span className="confirmation-icon">⚠</span>
+              <span>{confirmation.summary}</span>
+            </div>
+            <small>Expires in {confirmation.expires_in_seconds} s. Nothing changes until you confirm.</small>
+            <div className="confirmation-actions">
+              <button id="cancel-action" type="button" onClick={cancelAction} disabled={loading}>Cancel</button>
+              <button id="confirm-action" type="button" className="confirm" onClick={confirmAction} disabled={loading}>
+                {loading ? "Applying…" : "Confirm"}
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* ── Response area ── */}
+        {response && (
+          <div className="response-wrap">
+            <div className="response-tools">
+              <button
+                type="button"
+                onClick={speakLatestResponse}
+                disabled={!voiceStatus?.text_to_speech_available}
+                title={voiceStatus?.text_to_speech_available ? "Speak this response" : "Install spd-say or espeak-ng to enable TTS"}
+              >
+                🔊 Speak
+              </button>
+            </div>
+            <pre className="response" role="status">{response}</pre>
+          </div>
+        )}
+
+        {/* ── Hint ── */}
+        <p className="hint">
+          {loading
+            ? "Working — press Stop to cancel the Ollama request."
+            : pttActive
+            ? "Recording… press ⏹ Stop when finished speaking."
+            : mode === "chat"
+            ? "Chat mode never performs system actions. Switch to Control mode for desktop tasks."
+            : confirmation
+            ? "Nothing changes until you confirm above."
+            : "Read-only queries run instantly. Settings, launches and clipboard writes need confirmation."}
+        </p>
+
+        {/* ── Panels ── */}
+
+        {/* Chat history */}
+        {showChatHistory && (
+          <section className="panel" aria-label="Local chat history">
+            <div className="panel-heading">
+              <strong>Local chat history</strong>
+              <button type="button" onClick={clearChatHistory}>Delete all</button>
+            </div>
+            {!chatHistory || chatHistory.length === 0
+              ? <p className="empty-state">No saved chat messages.</p>
+              : <ul className="chat-history-list">
+                  {chatHistory.map((e) => (
+                    <li key={e.id} className={`chat-entry chat-${e.role}`}>
+                      <div className="chat-meta"><code>{e.role}</code><time>{new Date(e.created_at).toLocaleString()}</time></div>
+                      <p>{e.content}</p>
+                    </li>
+                  ))}
+                </ul>
+            }
+          </section>
+        )}
+
+        {/* Audit history */}
+        {showHistory && (
+          <section className="panel" aria-label="Local audit history">
+            <div className="panel-heading">
+              <strong>Audit history</strong>
+              <span className="panel-meta">Latest {history?.length ?? 0} events</span>
+            </div>
+            {!history || history.length === 0
+              ? <p className="empty-state">No events recorded yet.</p>
+              : <ul className="audit-list">
+                  {history.map((e) => (
+                    <li key={e.id} className="audit-entry">
+                      <div><span className={`outcome outcome-${e.outcome}`}>{e.outcome.replace(/_/g, " ")}</span><code>{e.action}</code></div>
+                      <p>{e.summary}</p>
+                      <time>{new Date(e.timestamp).toLocaleString()}</time>
+                    </li>
+                  ))}
+                </ul>
+            }
+          </section>
+        )}
+
+        {/* Memory */}
+        {showMemory && (
+          <section className="panel" aria-label="Opt-in assistant memory">
+            <div className="panel-heading">
+              <strong>Private memory</strong>
+              <button type="button" onClick={clearMemory}>Delete all</button>
+            </div>
+            <p className="panel-note">Only save details you explicitly choose. Nothing is remembered automatically.</p>
+            <form className="memory-form" onSubmit={saveMemory}>
+              <input value={memoryKey} onChange={(e) => setMemoryKey(e.target.value)} placeholder="Preference, e.g. preferred browser" />
+              <input value={memoryValue} onChange={(e) => setMemoryValue(e.target.value)} placeholder="Value, e.g. Firefox" />
+              <button type="submit">Save</button>
+            </form>
+            {!memory || memory.length === 0
+              ? <p className="empty-state">No saved memories.</p>
+              : <ul className="memory-list">
+                  {memory.map((e) => (
+                    <li key={e.id}>
+                      <div><code>{e.memory_key}</code><button type="button" onClick={() => void removeMemory(e.id)}>Forget</button></div>
+                      <p>{e.value}</p>
+                    </li>
+                  ))}
+                </ul>
+            }
+          </section>
+        )}
+
+        {/* Reminders */}
+        {showReminders && (
+          <section className="panel" aria-label="Reminders">
+            <div className="panel-heading">
+              <strong>Reminders</strong>
+              <span className="panel-meta panel-note-inline">Fires while app is running</span>
+            </div>
+            <p className="panel-note">Parse natural language or set a specific date/time.</p>
+
+            {/* NL input */}
+            <div className="nl-reminder-row">
+              <input
+                value={nlReminderText}
+                onChange={(e) => { setNlReminderText(e.target.value); setNlParsed(null); setNlError(""); }}
+                placeholder="e.g. remind me in 10 minutes to stretch"
+              />
+              <button type="button" onClick={parseNlReminder} disabled={!nlReminderText.trim()}>Parse</button>
+            </div>
+            {nlError && <p className="nl-error">{nlError}</p>}
+            {nlParsed && (
+              <p className="nl-parsed">
+                ✓ Parsed: <strong>{nlParsed.message}</strong> at <strong>{formatDue(nlParsed.due_at)}</strong> — review below then click Save.
+              </p>
+            )}
+
+            {/* Reminder form */}
+            <form className="reminder-form" onSubmit={addReminder}>
+              <input
+                type="datetime-local"
+                value={reminderDue}
+                onChange={(e) => setReminderDue(e.target.value)}
+                required
+              />
+              <input
+                value={reminderMsg}
+                onChange={(e) => setReminderMsg(e.target.value)}
+                placeholder="Reminder message"
+                required
+              />
+              <button type="submit">Save reminder</button>
+            </form>
+
+            {!reminders || reminders.length === 0
+              ? <p className="empty-state">No reminders.</p>
+              : <ul className="reminder-list">
+                  {reminders.map((r) => (
+                    <li key={r.id} className={`reminder-entry ${r.completed ? "reminder-done" : ""}`}>
+                      <div className="reminder-meta">
+                        <time>{formatDue(r.due_at)}</time>
+                        <div className="reminder-actions">
+                          {!r.completed && <button type="button" onClick={() => void completeReminder(r.id)}>Done</button>}
+                          <button type="button" onClick={() => void deleteReminder(r.id)}>Delete</button>
+                        </div>
+                      </div>
+                      <p className="reminder-message">{r.message}</p>
+                    </li>
+                  ))}
+                </ul>
+            }
+          </section>
+        )}
+
+        {/* Networks */}
+        {showNetworks && (
+          <section className="panel" aria-label="Saved Wi-Fi networks">
+            <div className="panel-heading">
+              <strong>Saved Wi-Fi networks</strong>
+              <button type="button" onClick={toggleNetworks}>Close</button>
+            </div>
+            <p className="panel-note">
+              Connect/Disconnect goes through the confirmation gate. Uses <code>nmcli</code> with fixed arguments — no shell execution.
+            </p>
+            {!savedNetworks || savedNetworks.length === 0
+              ? <p className="empty-state">No saved profiles found. Run <code>nmcli connection show</code> to check.</p>
+              : <ul className="network-list">
+                  {savedNetworks.map((name) => (
+                    <li key={name} className="network-entry">
+                      <span className="network-name">📶 {name}</span>
+                      <div className="network-actions">
+                        <button type="button" onClick={() => void connectToNetwork(name)}>Connect</button>
+                        <button type="button" onClick={() => void disconnectFromNetwork(name)}>Disconnect</button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+            }
+          </section>
+        )}
+
+      </section>
+    </main>
+  );
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

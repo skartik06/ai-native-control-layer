@@ -1,117 +1,178 @@
 # AI-Native System Control Layer
 
-Linux-first Tauri desktop overlay with a `Ctrl+Space` global toggle, local Ollama-backed structured intent parsing, and a narrow set of safe, read-only system tools.
+Privacy-first Linux desktop overlay — `Ctrl+Space` global toggle, local
+Ollama-backed intent parsing, and a narrow set of safe system tools.
+All compute stays on your machine. No data leaves.
+
+[![CI](https://github.com/skartik06/ai-native-control-layer/actions/workflows/verify-linux.yml/badge.svg)](https://github.com/skartik06/ai-native-control-layer/actions/workflows/verify-linux.yml)
+
+---
+
+## Features
+
+| Category | Action | Notes |
+|---|---|---|
+| **Read-only** | System info, file search, large-file list, logs, network status | No confirmation |
+| **Clipboard** | Read clipboard | No confirmation |
+| **Clipboard write** | `copy <text> to clipboard` | Confirmation required; uses `wl-copy` / `xclip` |
+| **Wi-Fi** | Connect / disconnect saved profiles | Confirmation; uses `nmcli` fixed args |
+| **Settings** | Dark mode, Wi-Fi toggle, brightness, volume, Do Not Disturb | Confirmation; GNOME `gsettings` |
+| **Media** | Play, pause, next, previous | Confirmation; `playerctl` |
+| **Launch** | File manager, browser, terminal, calendar | Confirmation; fixed app list |
+| **Notifications** | Desktop notification | Confirmation; `notify-send` |
+| **Screenshot** | Screen capture to Pictures | Confirmation |
+| **Window control** | Focus, minimize, maximize, close | Confirmation; `wmctrl` |
+| **Reminders** | Natural-language + date/time | Fires while app is running |
+| **Push-to-talk** | Local STT → command bar | Uses `whisper.cpp` locally |
+| **Chat mode** | Conversational Q&A | Never executes system actions |
+| **Memory** | Opt-in preference memory | Explicitly saved only, deletable |
+
+---
 
 ## Linux prerequisites
 
-Install a current Rust toolchain, Node.js 20+, Ollama, and your distro's Tauri/WebKit and NetworkManager dependencies. On Debian/Ubuntu, see the [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
-
-For the optional settings adapters, install `brightnessctl` for brightness control and `playerctl` for media playback controls. Dark mode and Do Not Disturb currently use GNOME's `gsettings` schemas; unsupported desktops return an error instead of guessing.
-
-For spoken output, install either `speech-dispatcher` (recommended; provides `spd-say`) or `espeak-ng`. The assistant detects these locally and enables **Speak response** only when one is present. Voice recognition is prepared as an optional local `whisper.cpp` integration and is intentionally not silently downloaded or sent to a cloud service.
-
-## Run
+### Required
 
 ```bash
-pnpm install
+sudo apt update
+sudo apt install -y \
+  build-essential curl git \
+  libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev \
+  libxdo-dev libssl-dev patchelf
+
+# Rust toolchain
+curl https://sh.rustup.rs -sSf | sh
+
+# Node.js (20+) via nvm or apt
+sudo apt install -y nodejs npm
+npm install -g pnpm@10 corepack
+```
+
+### Ollama (AI model backend)
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen3:4b        # ~2.5 GB, runs on CPU
+```
+
+### Optional — full feature set
+
+```bash
+# Media controls
+sudo apt install -y playerctl
+
+# Settings (GNOME)
+sudo apt install -y brightnessctl
+
+# Desktop notifications
+sudo apt install -y libnotify-bin
+
+# Clipboard write
+sudo apt install -y wl-clipboard xclip   # install both; app picks the right one
+
+# Window control
+sudo apt install -y wmctrl
+
+# Text-to-speech
+sudo apt install -y speech-dispatcher espeak-ng
+
+# Voice push-to-talk (local, no cloud)
+sudo apt install -y whisper-cpp          # Ubuntu 24.10+
+whisper-cli --download-model base.en     # run once to fetch the model
+```
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/skartik06/ai-native-control-layer.git
+cd ai-native-control-layer
+corepack enable && pnpm install
 pnpm tauri dev
 ```
 
-`Ctrl+Space` toggles the overlay. Some Linux desktop environments reserve that shortcut; if registration fails, change `shortcut` in `src/main.tsx` to an unused accelerator.
+Press **Ctrl+Space** to toggle the overlay. Some desktop environments
+reserve this; change `SHORTCUT` in `src/main.tsx` if registration fails.
 
-## Free local AI setup (Step 2)
+### Model selection
 
-Install [Ollama](https://ollama.com/download), then download the free local model once:
-
-```bash
-ollama run qwen3:4b
-```
-
-After its first response, stop it with `Ctrl+C`; Ollama keeps the model available locally. Then run the app:
+The app auto-detects installed Ollama models and prefers Qwen3. To force a
+specific model:
 
 ```bash
-pnpm tauri dev
+OLLAMA_MODEL=qwen3:1.7b pnpm tauri dev    # lighter, for small VMs
+OLLAMA_TIMEOUT_MS=60000 pnpm tauri dev    # 60 s Ollama timeout
 ```
 
-`qwen3:4b` is a ~2.5 GB download. Optionally set `OLLAMA_MODEL` to another locally downloaded model. The backend writes raw input and model output to its local app-data debug log as required for development; the log is not uploaded anywhere by the app.
+---
 
-If `OLLAMA_MODEL` is not set, the app now detects installed Ollama models and prefers Qwen3 (including `qwen3:1.7b` for small CPU-only VMs). Set `OLLAMA_MODEL` only when you want to force a particular installed model.
+## Safety model
 
-The intent request disables Qwen3 thinking and limits its context/output to the small size required for structured JSON. This avoids wasting CPU and RAM in virtual machines. Chat mode is intentionally separate from Control mode: it never executes an action, and common greetings, help, and thanks respond instantly without calling Ollama. The Stop button cancels either a Control or Chat request that is waiting on Ollama. The local response timeout is 180 seconds by default; to allow up to ten minutes for a request:
+- **No shell pass-through.** Every tool call uses a fixed, whitelisted
+  argument list. The model cannot construct or inject shell strings.
+- **Confirmation gate.** All state-changing actions (settings, clipboard,
+  Wi-Fi, launches) show a preview and expire after 60 seconds.
+- **Risk tiers enforced.** The planner independently re-validates every
+  model response and rejects unrecognised parameters, low confidence
+  (< 0.9), or a mismatched risk tier.
+- **Local-only.** Intent parsing, chat, STT, TTS, reminders, memory, and
+  audit logging all run on your machine.
 
-```bash
-OLLAMA_TIMEOUT_SECONDS=600 OLLAMA_MODEL=qwen3:4b pnpm tauri dev
+---
+
+## Running as a background service
+
+See [docs/BACKGROUND_SERVICE.md](docs/BACKGROUND_SERVICE.md) for systemd
+setup, optional environment flags, and wake-word architecture notes.
+
+---
+
+## Test checklist
+
+See [docs/DIRECT_UBUNTU_TEST.md](docs/DIRECT_UBUNTU_TEST.md) for the full
+acceptance test checklist.
+
+---
+
+## Architecture
+
+```
+Ctrl+Space
+    │
+    ▼
+React frontend (src/main.tsx)
+    │ Tauri IPC invoke
+    ▼
+parse_intent_internal (src-tauri/src/main.rs)
+    │
+    ├─ Local parsers (fast-path, no Ollama needed)
+    │    clipboard write · wifi connect/disconnect ·
+    │    screenshot · clipboard read · window control ·
+    │    toggle · media · notification · launch
+    │
+    └─ Ollama (qwen3:4b, structured JSON, think=false)
+         │
+         ▼
+     validate_intent → planned_risk → plan_intent
+         │
+         ▼
+     PendingConfirmation (60 s TTL)
+         │ User confirms
+         ▼
+     execute (nmcli / gsettings / playerctl / wl-copy / wmctrl …)
+         │
+         ▼
+     AuditLog (SQLite, local app-data dir)
 ```
 
-Explicitly saved memory is used only as contextual information for Chat mode. It is never created from raw chat automatically, is never sent to a cloud service by this app, and can be reviewed or deleted in the **Memory** panel.
+---
 
-## Current MVP scope
+## Scope boundaries
 
-The action planner independently validates every model response. It rejects unrecognised parameters, confidence below 0.9, and a model-selected risk tier that does not match the tool.
-
-Read-only tools that can run automatically on Linux are:
-
-- file search inside the current user's home directory (up to 50 results, limited walk depth)
-- system storage, memory, CPU load, and running applications
-- large-file listing inside the current user's home directory
-- NetworkManager Wi-Fi status through `nmcli`
-- recent systemd service logs through `journalctl`
-
-Settings changes, whitelisted application launches, and media playback changes require confirmation. File deletion, package installation, and all other high-risk operations are not implemented. No low-risk tool accepts or executes a shell string from the model.
-
-## Setting confirmation gate
-
-Medium-risk operations are whitelisted settings, application launches, and media playback controls. The backend validates every parameter before it shows a preview. A confirmation is kept only in backend memory, expires after 60 seconds, and is discarded on cancel or after one attempt. The frontend cannot modify the planned action after preview.
-
-Simple on/off requests for Wi-Fi, dark mode, and Do Not Disturb are locally parsed before Ollama. This makes the safety preview reliable even when a small local model cannot produce complete JSON. The backend still applies the same whitelist and confirmation rules.
-
-Current Linux adapters:
-
-- Wi-Fi on/off through NetworkManager `nmcli`
-- brightness from 0–100% through `brightnessctl`
-- GNOME dark mode through `gsettings`
-- GNOME Do Not Disturb through `gsettings`
-- system volume from 0–100% through PipeWire/PulseAudio `pactl`
-- play, pause, next, and previous track through `playerctl`
-- explicit desktop notifications through `notify-send` (install `libnotify-bin` on Debian/Ubuntu if needed)
-
-Application, media, and notification phrases such as `open firefox`, `opn files`, `pause music`, `next song`, and `remind me to drink water` are locally parsed before Ollama, then presented for confirmation. This preserves responsiveness even on a low-resource VM.
-
-## Local audit history (Step 5)
-
-Every parsed request is recorded in a local SQLite database: clarifications, rejections, confirmation previews, cancellations, expirations, tool starts, successes, and failures. Each event stores the validated action, risk tier, parameters, outcome, summary, and (where applicable) tool result. The database remains on the device in the app's OS data directory as `audit.sqlite3`; the app does not upload it. The backend exposes a bounded `get_audit_history` command for the future history UI.
-
-## Verification
-
-Run the frontend check locally:
-
-```bash
-pnpm build
-```
-
-Each push to `main` also runs a Linux compilation check in GitHub Actions.
-
-For the primary direct-Ubuntu test environment and exact acceptance checks, read [the Ubuntu GNOME test checklist](docs/DIRECT_UBUNTU_TEST.md).
-
-## Linux release packages (Step 7)
-
-The **Package Linux desktop app** GitHub Actions workflow produces a Debian package (`.deb`) and portable AppImage. Run it manually from the repository's **Actions** tab, or create and push a version tag such as `v0.1.0`. Manual runs upload an `ai-native-control-layer-linux` workflow artifact. A version tag also creates a GitHub Release with both files attached as direct downloads. On Debian/Kali/Ubuntu, install the downloaded Debian package with:
-
-```bash
-sudo apt install ./ai-native-control-layer_0.1.0_amd64.deb
-```
-
-The packaged app still needs a local Ollama service and selected model; for a CPU-only VM, start it with `OLLAMA_MODEL=qwen3:1.7b ai-native-control-layer`.
-
-## Start with the desktop session
-
-After installing the Debian package, enable the user-level assistant service once:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp /usr/share/doc/ai-native-control-layer/ai-native-control-layer.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ai-native-control-layer.service
-```
-
-The service starts the overlay when the user signs in and restarts it if it crashes. Disable it at any time with `systemctl --user disable --now ai-native-control-layer.service`.
+- File deletion, package installation, and all high-risk operations are not implemented.
+- Application launch is limited to a fixed whitelist (file manager, browser, terminal, calendar).
+- Wi-Fi actions only work with saved NetworkManager connection profiles.
+- Settings adapters (dark mode, Do Not Disturb) require GNOME; other desktops return a clear error.
+- Wake-word detection is **off by default** (see BACKGROUND_SERVICE.md).
