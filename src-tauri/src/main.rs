@@ -223,6 +223,11 @@ fn local_launch_request(request: &str) -> Option<Intent> {
         .any(|name| normalized.contains(name))
     {
         "terminal"
+    } else if ["calendar", "calender", "schedule"]
+        .iter()
+        .any(|name| normalized.contains(name))
+    {
+        "calendar"
     } else {
         return None;
     };
@@ -789,6 +794,7 @@ fn prepare_launch(params: &IntentParams) -> Result<LaunchTarget, String> {
         Some("file_manager") => Ok(LaunchTarget::FileManager),
         Some("browser") => Ok(LaunchTarget::Browser),
         Some("terminal") => Ok(LaunchTarget::Terminal),
+        Some("calendar") => Ok(LaunchTarget::Calendar),
         _ => Err("Only the file manager, browser, and terminal can be launched in this MVP. No action was taken.".to_string()),
     }
 }
@@ -800,6 +806,7 @@ fn launch_preview(target: &LaunchTarget) -> String {
         }
         LaunchTarget::Browser => "Open the default web browser.".to_string(),
         LaunchTarget::Terminal => "Open the default terminal.".to_string(),
+        LaunchTarget::Calendar => "Open the desktop calendar.".to_string(),
     }
 }
 
@@ -1120,6 +1127,7 @@ enum LaunchTarget {
     FileManager,
     Browser,
     Terminal,
+    Calendar,
 }
 
 #[derive(Clone)]
@@ -1830,6 +1838,7 @@ fn execute_launch(target: &LaunchTarget) -> Result<ToolExecution, String> {
             command
         }
         LaunchTarget::Terminal => Command::new("x-terminal-emulator"),
+        LaunchTarget::Calendar => Command::new("gnome-calendar"),
     };
     command.spawn().map_err(|_| {
         format!(
