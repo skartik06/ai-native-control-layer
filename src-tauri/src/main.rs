@@ -1310,6 +1310,15 @@ struct MemoryEntry {
 }
 
 #[derive(Serialize)]
+struct ReminderEntry {
+    id: i64,
+    created_at: String,
+    due_at: String,
+    message: String,
+    completed: bool,
+}
+
+#[derive(Serialize)]
 struct ChatEntry {
     id: i64,
     created_at: String,
@@ -1356,6 +1365,14 @@ fn initialize_audit_database(connection: &Connection) -> Result<(), String> {
                 value TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS assistant_memory_created_at_idx ON assistant_memory(created_at DESC);
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                message TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS reminders_due_at_idx ON reminders(due_at ASC);
             CREATE TABLE IF NOT EXISTS chat_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -2471,6 +2488,74 @@ fn delete_chat_history(app: AppHandle) -> Result<String, String> {
     Ok("Local chat history was deleted.".to_string())
 }
 
+#[tauri::command]
+fn create_reminder(
+    app: AppHandle,
+    due_at: String,
+    message: String,
+) -> Result<ReminderEntry, String> {
+    let due_at = due_at.trim();
+    let message = message.trim();
+    if due_at.is_empty() || message.is_empty() || message.len() > 500 {
+        return Err("A reminder needs a due time and message under 500 characters.".to_string());
+    }
+    let connection = open_audit_database(&app)?;
+    let created_at = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO reminders (created_at, due_at, message) VALUES (?1, ?2, ?3)",
+            params![created_at, due_at, message],
+        )
+        .map_err(|_| "Could not save the local reminder.".to_string())?;
+    Ok(ReminderEntry {
+        id: connection.last_insert_rowid(),
+        created_at,
+        due_at: due_at.to_string(),
+        message: message.to_string(),
+        completed: false,
+    })
+}
+
+#[tauri::command]
+fn get_reminders(app: AppHandle) -> Result<Vec<ReminderEntry>, String> {
+    let connection = open_audit_database(&app)?;
+    let mut statement = connection.prepare("SELECT id, created_at, due_at, message, completed FROM reminders ORDER BY completed, due_at LIMIT 200").map_err(|_| "Could not read local reminders.".to_string())?;
+    statement
+        .query_map([], |row| {
+            Ok(ReminderEntry {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                due_at: row.get(2)?,
+                message: row.get(3)?,
+                completed: row.get::<_, i64>(4)? != 0,
+            })
+        })
+        .map_err(|_| "Could not read local reminders.".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read local reminders.".to_string())
+}
+
+#[tauri::command]
+fn complete_reminder(app: AppHandle, id: i64) -> Result<String, String> {
+    let connection = open_audit_database(&app)?;
+    connection
+        .execute(
+            "UPDATE reminders SET completed = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|_| "Could not complete the reminder.".to_string())?;
+    Ok("Reminder completed.".to_string())
+}
+
+#[tauri::command]
+fn delete_reminder(app: AppHandle, id: i64) -> Result<String, String> {
+    let connection = open_audit_database(&app)?;
+    connection
+        .execute("DELETE FROM reminders WHERE id = ?1", params![id])
+        .map_err(|_| "Could not delete the reminder.".to_string())?;
+    Ok("Reminder deleted.".to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -2492,7 +2577,11 @@ fn main() {
             forget_memory,
             delete_all_memory,
             get_chat_history,
-            delete_chat_history
+            delete_chat_history,
+            create_reminder,
+            get_reminders,
+            complete_reminder,
+            delete_reminder
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");
