@@ -120,6 +120,17 @@ function App() {
     return () => window.removeEventListener("keydown", onEscape);
   }, []);
 
+  useEffect(() => {
+    if (!isTauri) return;
+    const check = async () => {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke<string[]>("deliver_due_reminders");
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     const request = input.trim();

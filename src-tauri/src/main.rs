@@ -1719,6 +1719,28 @@ fn get_network_status() -> Result<ToolExecution, String> {
     })
 }
 
+#[tauri::command]
+#[cfg(target_os = "linux")]
+fn get_saved_networks() -> Result<Vec<String>, String> {
+    let output = Command::new("nmcli")
+        .args(["-t", "-f", "NAME,TYPE", "connection", "show"])
+        .output()
+        .map_err(|_| "Could not query saved NetworkManager connections.".to_string())?;
+    if !output.status.success() {
+        return Err("NetworkManager could not list saved connections.".to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_suffix(":wifi").map(str::to_string))
+        .collect())
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "linux"))]
+fn get_saved_networks() -> Result<Vec<String>, String> {
+    Err("Saved-network details are available in the Linux desktop build only.".to_string())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn get_network_status() -> Result<ToolExecution, String> {
     Err("Network diagnostics are available in the Linux desktop MVP only.".to_string())
@@ -2556,6 +2578,41 @@ fn delete_reminder(app: AppHandle, id: i64) -> Result<String, String> {
     Ok("Reminder deleted.".to_string())
 }
 
+#[tauri::command]
+fn deliver_due_reminders(app: AppHandle) -> Result<Vec<String>, String> {
+    let connection = open_audit_database(&app)?;
+    let now = Utc::now().to_rfc3339();
+    let mut statement = connection.prepare("SELECT id, message FROM reminders WHERE completed = 0 AND due_at <= ?1 ORDER BY due_at LIMIT 20")
+        .map_err(|_| "Could not check due reminders.".to_string())?;
+    let due = statement
+        .query_map(params![now], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| "Could not check due reminders.".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not check due reminders.".to_string())?;
+    let mut delivered = Vec::new();
+    for (id, message) in due {
+        #[cfg(target_os = "linux")]
+        let sent = Command::new("notify-send")
+            .args(["Linux Assistant reminder", &message])
+            .status()
+            .is_ok_and(|status| status.success());
+        #[cfg(not(target_os = "linux"))]
+        let sent = false;
+        if sent {
+            connection
+                .execute(
+                    "UPDATE reminders SET completed = 1 WHERE id = ?1",
+                    params![id],
+                )
+                .map_err(|_| "Could not mark reminder delivered.".to_string())?;
+            delivered.push(message);
+        }
+    }
+    Ok(delivered)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -2570,6 +2627,7 @@ fn main() {
             cancel_pending_action,
             get_audit_history,
             get_runtime_profile,
+            get_saved_networks,
             get_voice_status,
             speak_text,
             remember_preference,
@@ -2581,7 +2639,8 @@ fn main() {
             create_reminder,
             get_reminders,
             complete_reminder,
-            delete_reminder
+            delete_reminder,
+            deliver_due_reminders
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Native Control Layer");
