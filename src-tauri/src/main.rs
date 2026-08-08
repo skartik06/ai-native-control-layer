@@ -475,7 +475,7 @@ fn local_clipboard_request(request: &str) -> Option<Intent> {
 fn local_window_request(request: &str) -> Option<Intent> {
     let request = request.trim();
     let lower = request.to_lowercase();
-    let (prefix, command) = [
+    let (window_title, command): (&str, &str) = [
         ("minimize ", "minimize"),
         ("maximize ", "maximize"),
         ("focus ", "focus"),
@@ -483,8 +483,10 @@ fn local_window_request(request: &str) -> Option<Intent> {
         ("close app ", "close"),
     ]
     .iter()
-    .find_map(|(prefix, command)| lower.strip_prefix(prefix).map(|name| (*name, *command)))?;
-    let name = prefix.trim();
+    .find_map(|(prefix, command)| {
+        lower.strip_prefix(*prefix).map(|title| (title, *command))
+    })?;
+    let name = window_title.trim();
     if name.is_empty() || name.len() > 100 {
         return None;
     }
@@ -1338,6 +1340,22 @@ async fn chat_with_assistant(
         .build()
         .map_err(|_| "Could not initialize the local assistant model.".to_string())?;
     let model = selected_ollama_model(&client).await;
+    let memory_context = {
+        let conn = open_audit_database(&app).unwrap_or_else(|_| {
+            rusqlite::Connection::open_in_memory().expect("in-memory db")
+        });
+        let mut stmt = conn
+            .prepare("SELECT memory_key, value FROM assistant_memory ORDER BY id DESC LIMIT 20")
+            .unwrap_or_else(|_| conn.prepare("SELECT 1").unwrap());
+        stmt.query_map([], |row| Ok(format!("- {}: {}", row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
+    };
+    let system_message = if memory_context.is_empty() {
+        "You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions.".to_string()
+    } else {
+        format!("You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions. The following are user-approved local preferences; use them only when relevant, never reveal them unless asked:\n{memory_context}")
+    };
     let body = json!({
         "model": model,
         "stream": false,
@@ -2963,7 +2981,7 @@ fn get_memory(app: AppHandle) -> Result<Vec<MemoryEntry>, String> {
     let mut statement = connection
         .prepare("SELECT id, created_at, category, memory_key, value FROM assistant_memory ORDER BY id DESC LIMIT 100")
         .map_err(|_| "Could not read local memory.".to_string())?;
-    statement
+    let rows = statement
         .query_map([], |row| {
             Ok(MemoryEntry {
                 id: row.get(0)?,
@@ -2973,8 +2991,8 @@ fn get_memory(app: AppHandle) -> Result<Vec<MemoryEntry>, String> {
                 value: row.get(4)?,
             })
         })
-        .map_err(|_| "Could not read local memory.".to_string())?
-        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read local memory.".to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
         .map_err(|_| "Could not read local memory.".to_string())
 }
 
@@ -3064,8 +3082,10 @@ fn create_reminder(
 #[tauri::command]
 fn get_reminders(app: AppHandle) -> Result<Vec<ReminderEntry>, String> {
     let connection = open_audit_database(&app)?;
-    let mut statement = connection.prepare("SELECT id, created_at, due_at, message, completed FROM reminders ORDER BY completed, due_at LIMIT 200").map_err(|_| "Could not read local reminders.".to_string())?;
-    statement
+    let mut statement = connection
+        .prepare("SELECT id, created_at, due_at, message, completed FROM reminders ORDER BY completed, due_at LIMIT 200")
+        .map_err(|_| "Could not read local reminders.".to_string())?;
+    let rows = statement
         .query_map([], |row| {
             Ok(ReminderEntry {
                 id: row.get(0)?,
@@ -3075,8 +3095,8 @@ fn get_reminders(app: AppHandle) -> Result<Vec<ReminderEntry>, String> {
                 completed: row.get::<_, i64>(4)? != 0,
             })
         })
-        .map_err(|_| "Could not read local reminders.".to_string())?
-        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read local reminders.".to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
         .map_err(|_| "Could not read local reminders.".to_string())
 }
 
