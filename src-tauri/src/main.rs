@@ -765,6 +765,7 @@ fn parse_reminder_natural(text: &str) -> Option<(String, String)> {
 }
 
 
+fn select_available_model(models: &[OllamaModel]) -> Option<String> {
     ["qwen3:4b-instruct", "qwen3:4b", "qwen3:1.7b"]
         .iter()
         .find_map(|preferred| {
