@@ -136,7 +136,7 @@ struct OllamaModel {
 }
 
 fn system_prompt() -> &'static str {
-    r#"You are the intent parser for a safety-first Linux desktop assistant. Return ONLY one JSON object, with no Markdown or explanation. It must have action, params, risk_tier, confidence, clarification_needed, and clarification_question keys.
+    r#"You are SK, the intent parser for a safety-first Linux desktop assistant. Return ONLY one JSON object, with no Markdown or explanation. It must have action, params, risk_tier, confidence, clarification_needed, and clarification_question keys.
 
 Allowed actions are only: search_files, get_system_info, list_large_files, get_network_status, toggle_setting, read_recent_logs, launch_app, media_control, send_notification, take_screenshot, read_clipboard, write_clipboard, window_control, wifi_connect, wifi_disconnect. Any request to delete files, install software, or perform an unsupported action MUST set clarification_needed to true.
 
@@ -1249,7 +1249,7 @@ async fn parse_intent_internal(
         .collect::<Vec<_>>()
         .join("\n");
     let system_message = if memory_context.is_empty() {
-        "You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions.".to_string()
+        "You are SK, a privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Never claim you executed a system action — tell the user to switch to Control mode for that.".to_string()
     } else {
         format!("You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions. The following are user-approved local preferences; use them only when relevant, never reveal them unless asked, and do not claim to have learned anything else:\n{memory_context}")
     };
@@ -1352,9 +1352,9 @@ async fn chat_with_assistant(
             .unwrap_or_default()
     };
     let system_message = if memory_context.is_empty() {
-        "You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions.".to_string()
+        "You are SK, a privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Never claim you executed a system action — tell the user to switch to Control mode for that.".to_string()
     } else {
-        format!("You are a helpful, privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Do not claim that you executed any system action. Tell the user to switch to Control mode for computer actions. The following are user-approved local preferences; use them only when relevant, never reveal them unless asked:\n{memory_context}")
+        format!("You are SK, a privacy-first Linux desktop assistant. Answer conversational questions naturally and concisely. Never claim you executed a system action — tell the user to switch to Control mode for that. The following are user-approved local preferences; use them only when relevant, never reveal them unless asked:\n{memory_context}")
     };
     let body = json!({
         "model": model,
@@ -1416,9 +1416,14 @@ fn local_chat_reply(message: &str) -> Option<String> {
         .collect::<String>();
     let text = normalized.trim();
     match text {
-        "hi" | "hello" | "hey" | "good morning" | "good afternoon" | "good evening" => Some("Hi! I'm your local Linux assistant. In Control mode I can inspect your system, open supported apps, change approved settings, and control media with confirmation. In Chat mode I can answer general questions using your local model.".to_string()),
-        "thanks" | "thank you" | "thx" => Some("You're welcome. Switch to Control mode whenever you want me to do something on your Linux desktop.".to_string()),
-        "help" | "what can you do" | "what can u do" | "who are you" => Some("I'm a privacy-first Linux assistant. Try Control mode for: show system information, show Wi-Fi status, find files, open Firefox, turn on dark mode, pause music, or next song. App, setting, and media changes always need your confirmation.".to_string()),
+        "hi" | "hello" | "hey" | "good morning" | "good afternoon" | "good evening" =>
+            Some("Hey! I'm SK, your local Linux assistant. In Control mode I can manage your system — open apps, change settings, control media, write to clipboard and more. Everything needs your confirmation before it runs. In Chat mode I can answer questions using your local model.".to_string()),
+        "thanks" | "thank you" | "thx" | "ty" =>
+            Some("Anytime. Switch to Control mode whenever you need me to do something on your system.".to_string()),
+        "help" | "what can you do" | "what can u do" | "who are you" | "what are you" =>
+            Some("I'm SK — a privacy-first Linux assistant that runs 100% on your machine. Control mode: system info, file search, dark mode, volume, Wi-Fi, clipboard, reminders, app launch, media controls. Chat mode: general questions via your local Ollama model. Nothing leaves your machine.".to_string()),
+        "good night" | "bye" | "goodbye" =>
+            Some("See you. Press Ctrl+Space anytime to bring me back.".to_string()),
         _ => None,
     }
 }

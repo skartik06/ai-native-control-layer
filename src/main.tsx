@@ -472,12 +472,12 @@ function App() {
 
   return (
     <main className="overlay-shell">
-      <section className="command-palette" aria-label="AI Native Control Layer">
+      <section className="command-palette" aria-label="SK — AI Assistant">
 
         {/* ── Top bar ── */}
         <div className="brand-row">
           <span className="status-dot" aria-hidden="true" />
-          <span className="brand-name">LINUX ASSISTANT</span>
+          <span className="brand-name">SK</span>
           <span className="profile-badge">
             {runtimeProfile ? `${runtimeProfile.profile.toUpperCase()} · ${modelLabel}` : "Initialising…"}
           </span>
@@ -494,7 +494,7 @@ function App() {
         {/* ── Intro ── */}
         <section className="assistant-intro">
           <p className="eyebrow">PRIVATE · LOCAL-FIRST · SAFETY-GATED</p>
-          <h1>What can I help you do?</h1>
+          <h1>Hey, what can I do for you?</h1>
           {runtimeProfile && (
             <p className="runtime-summary">
               {runtimeProfile.summary} — {runtimeProfile.total_memory_gb} GB RAM · {runtimeProfile.cpu_cores} CPU cores
@@ -553,10 +553,11 @@ function App() {
             onChange={(e) => setInput(e.target.value)}
             disabled={loading || Boolean(confirmation) || pttLoading}
             placeholder={
-              pttLoading ? "Transcribing…" :
+              pttLoading ? "SK is transcribing…" :
+              pttActive  ? "SK is listening…" :
               mode === "chat"
-                ? "Ask a general question (uses your local model)"
-                : "Try: copy hello to clipboard · connect to wifi Home · remind me in 10 min to stretch"
+                ? "Chat with SK — ask anything"
+                : "Tell SK what to do… copy text · connect wifi · remind me in 10 min to stretch"
             }
             aria-label="Command input"
           />
@@ -612,14 +613,14 @@ function App() {
         {/* ── Hint ── */}
         <p className="hint">
           {loading
-            ? "Working — press Stop to cancel the Ollama request."
+            ? "SK is working — press Stop to cancel."
             : pttActive
-            ? "Recording… press ⏹ Stop when finished speaking."
+            ? "SK is listening… press ⏹ Stop when done speaking."
             : mode === "chat"
-            ? "Chat mode never performs system actions. Switch to Control mode for desktop tasks."
+            ? "Chat mode — SK will never perform system actions here. Switch to Control for that."
             : confirmation
-            ? "Nothing changes until you confirm above."
-            : "Read-only queries run instantly. Settings, launches and clipboard writes need confirmation."}
+            ? "SK is waiting — nothing changes until you confirm."
+            : "Read-only queries run instantly. Settings, clipboard and launches need your confirmation."}
         </p>
 
         {/* ── Panels ── */}
