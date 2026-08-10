@@ -8,19 +8,23 @@ use serde_json::json;
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
-    sync::Mutex,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 use sysinfo::{Disks, System};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::oneshot;
 
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
 const OLLAMA_TAGS_URL: &str = "http://127.0.0.1:11434/api/tags";
 const DEFAULT_OLLAMA_TIMEOUT_SECONDS: u64 = 180;
+
+// ── Daemon state ─────────────────────────────────────────────────────────────
+#[derive(Default)]
+struct DaemonHandle(Arc<Mutex<Option<std::process::Child>>>);
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -3349,11 +3353,140 @@ fn transcribe_audio(_app: AppHandle, _audio_path: String) -> Result<String, Stri
     Err("Voice transcription is available in the Linux desktop build only.".to_string())
 }
 
+// ── SK Voice Daemon management ───────────────────────────────────────────────
+
+#[tauri::command]
+fn get_daemon_running(daemon: State<'_, DaemonHandle>) -> bool {
+    let guard = daemon.0.lock().unwrap_or_else(|e| e.into_inner());
+    guard.is_some()
+}
+
+#[tauri::command]
+fn stop_sk_daemon(daemon: State<'_, DaemonHandle>, app: AppHandle) -> Result<String, String> {
+    let mut guard = daemon.0.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = app.emit("sk://daemon", serde_json::json!({"type":"stopped","text":"SK voice daemon stopped."}));
+        Ok("SK voice daemon stopped.".to_string())
+    } else {
+        Ok("Daemon was not running.".to_string())
+    }
+}
+
+#[tauri::command]
+fn start_sk_daemon(daemon: State<'_, DaemonHandle>, app: AppHandle) -> Result<String, String> {
+    // Stop any existing daemon first
+    {
+        let mut guard = daemon.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    // Locate sk_daemon.py relative to the binary
+    let daemon_script = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("../../../sk-daemon/sk_daemon.py")))
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .unwrap_or_else(|| std::path::PathBuf::from("sk-daemon/sk_daemon.py"));
+
+    if !daemon_script.exists() {
+        return Err(format!(
+            "sk_daemon.py not found at {}. Make sure the sk-daemon/ folder is in your project root.",
+            daemon_script.display()
+        ));
+    }
+
+    let child = std::process::Command::new("python3")
+        .arg(&daemon_script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Could not start daemon: {e}. Is python3 installed?"))?;
+
+    // Read stdout in a background thread
+    let stdout = child.stdout.as_ref()
+        .map(|_| ())
+        .ok_or("Could not capture daemon stdout".to_string())?;
+    drop(stdout);
+
+    // Re-spawn to get stdout handle properly
+    let mut child2 = std::process::Command::new("python3")
+        .arg(&daemon_script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Could not start daemon: {e}"))?;
+
+    let daemon_stdout = child2.stdout.take().ok_or("No stdout".to_string())?;
+    let app_clone = app.clone();
+    let daemon_arc = daemon.0.clone();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(daemon_stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+
+            // Forward every event to the frontend
+            let _ = app_clone.emit("sk://daemon", &msg);
+
+            // Auto-process voice commands
+            if msg.get("type").and_then(|t| t.as_str()) == Some("command") {
+                if let Some(text) = msg.get("text").and_then(|t| t.as_str()) {
+                    let text = text.to_string();
+                    let app2 = app_clone.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async move {
+                            // Emit processing status
+                            let _ = app2.emit("sk://daemon", serde_json::json!({
+                                "type": "processing_command",
+                                "text": format!("SK processing: {text}")
+                            }));
+                            // Use reqwest to call our own process_request through the Tauri command
+                            // Since we can't call Tauri commands internally easily, emit the text
+                            // to the frontend which will invoke process_request
+                            let _ = app2.emit("sk://voice-command", serde_json::json!({
+                                "text": text
+                            }));
+                        });
+                    });
+                }
+            }
+        }
+        // Daemon exited
+        let _ = app_clone.emit("sk://daemon", serde_json::json!({
+            "type": "stopped",
+            "text": "SK voice daemon exited."
+        }));
+        let mut guard = daemon_arc.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    });
+
+    // Store child handle
+    {
+        let mut guard = daemon.0.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(child2);
+    }
+
+    let _ = app.emit("sk://daemon", serde_json::json!({
+        "type": "starting",
+        "text": "SK voice daemon starting…"
+    }));
+
+    Ok("SK voice daemon started.".to_string())
+}
+
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PendingConfirmation::default())
         .manage(RequestCancellation::default())
+        .manage(DaemonHandle::default())
         .invoke_handler(tauri::generate_handler![
             parse_intent,
             chat_with_assistant,
@@ -3382,10 +3515,13 @@ fn main() {
             get_installed_models,
             save_temp_audio,
             transcribe_audio,
-            get_whisper_model_path
+            get_whisper_model_path,
+            start_sk_daemon,
+            stop_sk_daemon,
+            get_daemon_running
         ])
         .run(tauri::generate_context!())
-        .expect("error while running AI Native Control Layer");
+        .expect("error while running SK");
 }
 
 #[cfg(test)]

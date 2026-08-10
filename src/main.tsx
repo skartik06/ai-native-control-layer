@@ -97,6 +97,10 @@ function App() {
     });
   }
 
+  // SK Voice Daemon
+  const [daemonRunning, setDaemonRunning] = useState(false);
+  const [daemonStatus, setDaemonStatus] = useState("Voice daemon off");
+
   // ── Bootstrap ──────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -148,6 +152,79 @@ function App() {
     const t = window.setInterval(() => void check(), 60_000);
     return () => window.clearInterval(t);
   }, []);
+
+  // SK Daemon events
+  useEffect(() => {
+    if (!isTauri) return;
+    let unlisten1: (() => void) | undefined;
+    let unlisten2: (() => void) | undefined;
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      // Daemon status events
+      listen<{ type: string; text: string }>("sk://daemon", (event) => {
+        const { type, text } = event.payload;
+        setDaemonStatus(text);
+        if (type === "stopped") setDaemonRunning(false);
+        if (type === "starting" || type === "ready" || type === "wake" ||
+            type === "recording" || type === "processing" || type === "processing_command") {
+          setDaemonRunning(true);
+        }
+      }).then((fn) => { unlisten1 = fn; });
+
+      // Voice commands — auto-submit as if user typed them
+      listen<{ text: string }>("sk://voice-command", (event) => {
+        const text = event.payload.text.trim();
+        if (!text) return;
+        setInput(text);
+        setDaemonStatus(`SK heard: "${text}"`);
+        // Auto-submit after a short delay so React re-renders the input
+        setTimeout(() => {
+          setInput("");
+          setLoading(true);
+          setResponse("");
+          import("@tauri-apps/api/core").then(async ({ invoke }) => {
+            try {
+              const result = await invoke<ProcessResult>("process_request", { request: text });
+              if (result.confirmation) {
+                setConfirmation(result.confirmation);
+                setResponse(result.message);
+                void autoSpeakText(result.message);
+              } else {
+                const msg = result.intent.clarification_needed
+                  ? `Clarification needed: ${result.message}`
+                  : `${result.message}\n\n${JSON.stringify(result.execution, null, 2)}`;
+                setResponse(msg);
+                void autoSpeakText(result.message);
+              }
+            } catch (err) {
+              setResponse(`Voice command error: ${String(err)}`);
+            } finally {
+              setLoading(false);
+            }
+          });
+        }, 100);
+      }).then((fn) => { unlisten2 = fn; });
+    });
+    return () => { unlisten1?.(); unlisten2?.(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoSpeak, voiceStatus]);
+
+  async function toggleDaemon() {
+    if (!isTauri) return;
+    const { invoke } = await import("@tauri-apps/api/core");
+    try {
+      if (daemonRunning) {
+        await invoke<string>("stop_sk_daemon");
+        setDaemonRunning(false);
+        setDaemonStatus("Voice daemon stopped");
+      } else {
+        await invoke<string>("start_sk_daemon");
+        setDaemonRunning(true);
+        setDaemonStatus("SK daemon starting…");
+      }
+    } catch (err) {
+      setDaemonStatus(`Daemon error: ${String(err)}`);
+    }
+  }
 
   // ── Command submit ─────────────────────────────────────────────────────────
 
@@ -583,7 +660,21 @@ function App() {
             >
               {autoSpeak ? "🔈 Auto-speak ON" : "🔈 Auto-speak OFF"}
             </button>
+            {/* Voice Daemon toggle */}
+            <button
+              id="voice-daemon-toggle"
+              className={`cap-badge cap-toggle ${daemonRunning ? "cap-active" : ""}`}
+              type="button"
+              onClick={toggleDaemon}
+              title={daemonRunning ? `${daemonStatus} — click to stop` : "Start SK voice daemon (say 'Hey SK' to activate)"}
+            >
+              {daemonRunning ? "👂 SK listening" : "👂 Voice daemon"}
+            </button>
           </div>
+          {/* Daemon status line */}
+          {daemonRunning && (
+            <p className="daemon-status">{daemonStatus}</p>
+          )}
         </section>
 
         {/* ── Input form ── */}
