@@ -83,6 +83,20 @@ function App() {
   const pttRef = useRef<MediaRecorder | null>(null);
   const pttChunksRef = useRef<Blob[]>([]);
 
+  // Auto-speak
+  const [autoSpeak, setAutoSpeak] = useState<boolean>(() => {
+    try { return localStorage.getItem("sk_auto_speak") === "true"; } catch { return false; }
+  });
+  const [isSpeaking, setIsSpeaking] = useState(false);
+
+  function toggleAutoSpeak() {
+    setAutoSpeak((prev) => {
+      const next = !prev;
+      try { localStorage.setItem("sk_auto_speak", String(next)); } catch { /**/ }
+      return next;
+    });
+  }
+
   // ── Bootstrap ──────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -150,20 +164,23 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       if (mode === "chat") {
-        setResponse(await invoke<string>("chat_with_assistant", { message: request }));
+        const reply = await invoke<string>("chat_with_assistant", { message: request });
+        setResponse(reply);
         setInput("");
+        void autoSpeakText(reply);
         return;
       }
       const result = await invoke<ProcessResult>("process_request", { request });
       if (result.confirmation) {
         setConfirmation(result.confirmation);
         setResponse(result.message);
+        void autoSpeakText(result.message);
       } else {
-        setResponse(
-          result.intent.clarification_needed
-            ? `Clarification needed: ${result.message}`
-            : `${result.message}\n\n${JSON.stringify(result.execution, null, 2)}`
-        );
+        const msg = result.intent.clarification_needed
+          ? `Clarification needed: ${result.message}`
+          : `${result.message}\n\n${JSON.stringify(result.execution, null, 2)}`;
+        setResponse(msg);
+        void autoSpeakText(result.message);
       }
       setInput("");
     } catch (error) {
@@ -187,11 +204,23 @@ function App() {
     if (!isTauri || !response) return;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const status = await invoke<string>("speak_text", { text: response });
-      setResponse((r) => `${r}\n\n${status}`);
+      setIsSpeaking(true);
+      await invoke<string>("speak_text", { text: response });
     } catch (error) {
-      setResponse((r) => `${r}\n\nVoice output unavailable: ${readableError(error)}`);
+      setResponse((r) => `${r}\n\nVoice unavailable: ${readableError(error)}`);
+    } finally {
+      setIsSpeaking(false);
     }
+  }
+
+  async function autoSpeakText(text: string) {
+    if (!autoSpeak || !isTauri || !voiceStatus?.text_to_speech_available) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      setIsSpeaking(true);
+      await invoke<string>("speak_text", { text });
+    } catch { /* silent — auto-speak is best-effort */ }
+    finally { setIsSpeaking(false); }
   }
 
   async function confirmAction() {
@@ -200,8 +229,10 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const result = await invoke<ToolExecution>("confirm_pending_action");
-      setResponse(`${result.summary}\n\n${JSON.stringify(result.data, null, 2)}`);
+      const msg = `${result.summary}\n\n${JSON.stringify(result.data, null, 2)}`;
+      setResponse(msg);
       setConfirmation(null);
+      void autoSpeakText(result.summary);
     } catch (error) {
       setResponse(`Action not performed: ${String(error)}`);
       setConfirmation(null);
@@ -528,7 +559,7 @@ function App() {
           <div className="capability-row">
             <span className={`cap-badge ${voiceStatus?.text_to_speech_available ? "cap-ok" : "cap-warn"}`}
               title={voiceStatus?.summary}>
-              {voiceStatus?.text_to_speech_available ? "🔊 TTS ready" : "🔇 TTS setup needed"}
+              {isSpeaking ? "🔊 SK is speaking…" : voiceStatus?.text_to_speech_available ? "🔊 TTS ready" : "🔇 TTS setup needed"}
             </span>
             <span className={`cap-badge ${voiceStatus?.speech_to_text_available ? "cap-ok" : "cap-warn"}`}
               title="Install whisper.cpp for voice input">
@@ -541,6 +572,17 @@ function App() {
             <span className="cap-badge cap-ok" title="System health, files, and read-only queries">📊 System · Files</span>
             <span className="cap-badge cap-ok" title="Media controls via playerctl">🎵 Media</span>
             <span className="cap-badge cap-ok" title="Dark mode, brightness, volume, Wi-Fi">⚙ Settings</span>
+            {/* Auto-speak toggle */}
+            <button
+              id="auto-speak-toggle"
+              className={`cap-badge cap-toggle ${autoSpeak ? "cap-active" : ""}`}
+              type="button"
+              onClick={toggleAutoSpeak}
+              title={autoSpeak ? "SK speaks automatically — click to turn off" : "Click to make SK speak every response automatically"}
+              disabled={!voiceStatus?.text_to_speech_available}
+            >
+              {autoSpeak ? "🔈 Auto-speak ON" : "🔈 Auto-speak OFF"}
+            </button>
           </div>
         </section>
 
@@ -600,10 +642,20 @@ function App() {
               <button
                 type="button"
                 onClick={speakLatestResponse}
-                disabled={!voiceStatus?.text_to_speech_available}
-                title={voiceStatus?.text_to_speech_available ? "Speak this response" : "Install spd-say or espeak-ng to enable TTS"}
+                disabled={!voiceStatus?.text_to_speech_available || isSpeaking}
+                title={voiceStatus?.text_to_speech_available ? "Make SK speak this response" : "Install spd-say or espeak-ng"}
+                className={isSpeaking ? "speaking-active" : ""}
               >
-                🔊 Speak
+                {isSpeaking ? "🔊 Speaking…" : "🔊 Speak"}
+              </button>
+              <button
+                type="button"
+                onClick={toggleAutoSpeak}
+                disabled={!voiceStatus?.text_to_speech_available}
+                className={autoSpeak ? "speaking-active" : ""}
+                title="Toggle auto-speak for all responses"
+              >
+                {autoSpeak ? "Auto ON" : "Auto OFF"}
               </button>
             </div>
             <pre className="response" role="status">{response}</pre>
