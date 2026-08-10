@@ -12,7 +12,41 @@ sudo apt-get install -y \
     python3-pyaudio \
     portaudio19-dev \
     python3-numpy \
-    whisper-cpp
+    whisper-cpp \
+    alsa-utils
+
+# ── Piper TTS (natural voice) ──────────────────────────────────────────────
+echo "==> Installing piper TTS..."
+PIPER_DIR="$HOME/.local/share/piper"
+PIPER_BIN="$HOME/.local/bin/piper"
+mkdir -p "$PIPER_DIR" "$HOME/.local/bin"
+
+if ! command -v piper &>/dev/null; then
+    # Download piper binary (amd64 Linux)
+    PIPER_RELEASE="https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz"
+    TMP_TAR=$(mktemp /tmp/piper_XXXXXX.tar.gz)
+    echo "  Downloading piper binary..."
+    curl -L -o "$TMP_TAR" "$PIPER_RELEASE" 2>/dev/null && \
+        tar -xzf "$TMP_TAR" -C "$HOME/.local/" && \
+        chmod +x "$HOME/.local/piper/piper" && \
+        ln -sf "$HOME/.local/piper/piper" "$PIPER_BIN" && \
+        echo "  piper installed at $PIPER_BIN" || \
+        echo "  piper download failed — install manually from https://github.com/rhasspy/piper/releases"
+    rm -f "$TMP_TAR"
+fi
+
+# Download piper voice model (en_US-lessac-medium ~60 MB)
+VOICE_MODEL="$PIPER_DIR/en_US-lessac-medium.onnx"
+VOICE_CONFIG="$PIPER_DIR/en_US-lessac-medium.onnx.json"
+if [ ! -f "$VOICE_MODEL" ]; then
+    echo "  Downloading en_US-lessac-medium voice model (~60 MB)..."
+    BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+    curl -L -o "$VOICE_MODEL"  "$BASE/en_US-lessac-medium.onnx"  2>/dev/null
+    curl -L -o "$VOICE_CONFIG" "$BASE/en_US-lessac-medium.onnx.json" 2>/dev/null
+    echo "  Voice model saved to $VOICE_MODEL"
+else
+    echo "  Piper voice model already present."
+fi
 
 # Python packages
 pip3 install --user \

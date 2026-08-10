@@ -1584,33 +1584,74 @@ fn executable_available(_: &str) -> bool {
     false
 }
 
+// Piper model search paths
+#[cfg(target_os = "linux")]
+fn piper_model_paths() -> Vec<std::path::PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    vec![
+        // User-installed via pip / manual download
+        format!("{home}/.local/share/piper/en_US-lessac-medium.onnx").into(),
+        format!("{home}/.local/share/piper/en_US-lessac-high.onnx").into(),
+        format!("{home}/.local/share/piper/en_US-ryan-high.onnx").into(),
+        format!("{home}/.local/share/piper/en_US-ryan-medium.onnx").into(),
+        format!("{home}/.local/share/piper/en_GB-alan-medium.onnx").into(),
+        // System-wide
+        "/usr/share/piper/voices/en_US-lessac-medium.onnx".into(),
+        "/usr/local/share/piper/en_US-lessac-medium.onnx".into(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn find_piper_model() -> Option<std::path::PathBuf> {
+    // Honour explicit env override
+    if let Ok(p) = env::var("PIPER_MODEL") {
+        let pb = std::path::PathBuf::from(&p);
+        if pb.exists() { return Some(pb); }
+    }
+    piper_model_paths().into_iter().find(|p| p.exists())
+}
+
 #[tauri::command]
 fn get_voice_status() -> VoiceStatus {
-    let text_to_speech_engine = if executable_available("spd-say") {
-        Some("spd-say".to_string())
-    } else if executable_available("espeak-ng") {
-        Some("espeak-ng".to_string())
-    } else {
-        None
-    };
-    let speech_to_text_engine = if executable_available("whisper-cli") {
-        Some("whisper-cli".to_string())
-    } else if executable_available("whisper-cpp") {
-        Some("whisper-cpp".to_string())
-    } else {
-        None
-    };
-    let summary = match (&text_to_speech_engine, &speech_to_text_engine) {
-        (Some(tts), Some(stt)) => format!("Voice output ({tts}) and local speech recognition ({stt}) are available."),
-        (Some(tts), None) => format!("Voice output is available through {tts}. Install whisper.cpp to enable local voice input."),
-        (None, _) => "Voice output is not installed. Install speech-dispatcher or espeak-ng on Linux.".to_string(),
-    };
+    #[cfg(target_os = "linux")]
+    {
+        let piper_available = executable_available("piper") && find_piper_model().is_some();
+        let text_to_speech_engine = if piper_available {
+            Some("piper".to_string())
+        } else if executable_available("spd-say") {
+            Some("spd-say".to_string())
+        } else if executable_available("espeak-ng") {
+            Some("espeak-ng".to_string())
+        } else {
+            None
+        };
+        let speech_to_text_engine = if executable_available("whisper-cli") {
+            Some("whisper-cli".to_string())
+        } else if executable_available("whisper-cpp") {
+            Some("whisper-cpp".to_string())
+        } else {
+            None
+        };
+        let summary = match (&text_to_speech_engine, &speech_to_text_engine) {
+            (Some(tts), Some(stt)) => format!("Voice output ({tts}) and local speech recognition ({stt}) are available."),
+            (Some(tts), None) => format!("Voice output available through {tts}. Install whisper.cpp for voice input."),
+            (None, _) => "Voice output not installed. Install piper, spd-say, or espeak-ng.".to_string(),
+        };
+        return VoiceStatus {
+            text_to_speech_available: text_to_speech_engine.is_some(),
+            speech_to_text_available: speech_to_text_engine.is_some(),
+            text_to_speech_engine,
+            speech_to_text_engine,
+            summary,
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
     VoiceStatus {
-        text_to_speech_available: text_to_speech_engine.is_some(),
-        speech_to_text_available: speech_to_text_engine.is_some(),
-        text_to_speech_engine,
-        speech_to_text_engine,
-        summary,
+        text_to_speech_available: false,
+        speech_to_text_available: false,
+        text_to_speech_engine: None,
+        speech_to_text_engine: None,
+        summary: "Voice features are available in the Linux desktop build only.".to_string(),
     }
 }
 
@@ -1620,30 +1661,68 @@ fn speak_text(text: String) -> Result<String, String> {
     if text.is_empty() {
         return Err("There is no response to speak.".to_string());
     }
-    let clipped = text.chars().take(1_000).collect::<String>();
+    // Strip JSON blobs so SK doesn't read raw data aloud
+    let clipped: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('{') && !l.trim_start().starts_with('"'))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(500)
+        .collect();
+    let clipped = if clipped.trim().is_empty() {
+        text.chars().take(300).collect::<String>()
+    } else {
+        clipped
+    };
+
     #[cfg(target_os = "linux")]
     {
-        let program = if executable_available("spd-say") {
-            "spd-say"
-        } else if executable_available("espeak-ng") {
-            "espeak-ng"
-        } else {
-            return Err(
-                "Voice output is not installed. Install speech-dispatcher or espeak-ng first."
-                    .to_string(),
-            );
-        };
-        Command::new(program)
-            .arg(&clipped)
-            .spawn()
-            .map_err(|_| "Could not start the Linux speech engine.".to_string())?;
-        return Ok("Speaking the latest assistant response.".to_string());
+        // ── 1. Piper TTS (natural voice) ──────────────────────────────────────
+        if executable_available("piper") {
+            if let Some(model) = find_piper_model() {
+                let result = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!(
+                        "echo {} | piper --model {} --output_raw 2>/dev/null | aplay -r 22050 -f S16_LE -t raw - 2>/dev/null &",
+                        shell_escape(&clipped),
+                        shell_escape(&model.to_string_lossy())
+                    ))
+                    .spawn();
+                if result.is_ok() {
+                    return Ok("SK is speaking (piper natural voice).".to_string());
+                }
+            }
+        }
+        // ── 2. spd-say (speech-dispatcher) ────────────────────────────────────
+        if executable_available("spd-say") {
+            Command::new("spd-say")
+                .arg("--wait")
+                .arg(&clipped)
+                .spawn()
+                .map_err(|_| "Could not start spd-say.".to_string())?;
+            return Ok("SK is speaking (spd-say).".to_string());
+        }
+        // ── 3. espeak-ng fallback ──────────────────────────────────────────────
+        if executable_available("espeak-ng") {
+            Command::new("espeak-ng")
+                .arg(&clipped)
+                .spawn()
+                .map_err(|_| "Could not start espeak-ng.".to_string())?;
+            return Ok("SK is speaking (espeak-ng).".to_string());
+        }
+        Err("No TTS engine found. Run: sudo apt install piper speech-dispatcher".to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = clipped;
         Err("Voice output is available in the Linux desktop build only.".to_string())
     }
+}
+
+/// Safely shell-escape a string by wrapping in single quotes.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 #[derive(Serialize)]
