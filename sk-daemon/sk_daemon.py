@@ -52,9 +52,105 @@ def log(msg: str) -> None:
 
 # ── Audio config ─────────────────────────────────────────────────────────────
 SAMPLE_RATE   = 16_000
-CHUNK_SIZE    = 1_280   # 80 ms at 16 kHz — openwakeword recommended
+CHUNK_SIZE     = 1_280   # 80 ms at 16 kHz — openwakeword recommended
 RECORD_SECONDS = 5
 WAKE_THRESHOLD = 0.5
+
+# ── Custom wake word verifier path ───────────────────────────────────────────
+VERIFIER_PATH = os.path.expanduser(
+    "~/.local/share/ai-native-control-layer/hey_sk_verifier.npz"
+)
+
+
+def load_custom_verifier():
+    """Load DTW templates + threshold from saved .npz file."""
+    if not os.path.isfile(VERIFIER_PATH):
+        return None
+    try:
+        data = np.load(VERIFIER_PATH, allow_pickle=True)
+        templates  = list(data["templates"])
+        threshold  = float(data["threshold"][0])
+        log(f"Custom 'Hey SK' verifier loaded ({len(templates)} templates, thr={threshold:.3f})")
+        return {"templates": templates, "threshold": threshold}
+    except Exception as ex:
+        log(f"Could not load custom verifier: {ex}")
+        return None
+
+
+def _preemphasis(signal, coeff=0.97):
+    return np.append(signal[0], signal[1:] - coeff * signal[:-1])
+
+
+def _framing(signal, frame_len, hop_len):
+    n_frames = 1 + (len(signal) - frame_len) // hop_len
+    idx = (
+        np.tile(np.arange(frame_len), (n_frames, 1))
+        + np.tile(np.arange(n_frames) * hop_len, (frame_len, 1)).T
+    )
+    return signal[idx]
+
+
+def _mel_filterbank(n_filt, n_fft, sr, fmin=80.0, fmax=8000.0):
+    def hz2mel(f): return 2595 * np.log10(1 + f / 700)
+    def mel2hz(m): return 700 * (10 ** (m / 2595) - 1)
+    mel_pts = np.linspace(hz2mel(fmin), hz2mel(fmax), n_filt + 2)
+    hz_pts  = mel2hz(mel_pts)
+    bins    = np.floor((n_fft + 1) * hz_pts / sr).astype(int)
+    fbank   = np.zeros((n_filt, n_fft // 2 + 1))
+    for m in range(1, n_filt + 1):
+        for k in range(bins[m - 1], bins[m]):
+            fbank[m - 1, k] = (k - bins[m - 1]) / (bins[m] - bins[m - 1] + 1e-8)
+        for k in range(bins[m], bins[m + 1]):
+            fbank[m - 1, k] = (bins[m + 1] - k) / (bins[m + 1] - bins[m] + 1e-8)
+    return fbank
+
+
+def extract_mfcc_from_bytes(pcm_bytes: bytes, n_mfcc: int = 13) -> np.ndarray:
+    """Extract MFCC from raw PCM16 bytes (pure numpy)."""
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    samples = _preemphasis(samples)
+    frame_len = int(SAMPLE_RATE * 0.025)
+    hop_len   = int(SAMPLE_RATE * 0.010)
+    n_fft     = 512
+    n_filt    = 40
+    # Pad if too short
+    if len(samples) < frame_len:
+        samples = np.pad(samples, (0, frame_len - len(samples)))
+    frames   = _framing(samples, frame_len, hop_len)
+    frames  *= np.hamming(frame_len)
+    mag      = np.abs(np.fft.rfft(frames, n=n_fft))
+    fbank    = _mel_filterbank(n_filt, n_fft, SAMPLE_RATE)
+    mel_spec = np.log(np.dot(mag, fbank.T) + 1e-8)
+    dct_mfcc = np.zeros((mel_spec.shape[0], n_mfcc))
+    for k in range(n_mfcc):
+        dct_mfcc[:, k] = np.sum(
+            mel_spec * np.cos(np.pi * k / n_filt * (np.arange(n_filt) + 0.5)), axis=1
+        )
+    mean = dct_mfcc.mean(axis=0, keepdims=True)
+    std  = dct_mfcc.std(axis=0, keepdims=True) + 1e-8
+    return (dct_mfcc - mean) / std
+
+
+def dtw_distance(a: np.ndarray, b: np.ndarray) -> float:
+    n, m = len(a), len(b)
+    D = np.full((n + 1, m + 1), np.inf)
+    D[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = float(np.linalg.norm(a[i - 1] - b[j - 1]))
+            D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+    return D[n, m] / (n + m)
+
+
+def verify_with_dtw(pcm_bytes: bytes, verifier: dict) -> bool:
+    """Return True if the audio matches the 'Hey SK' templates via DTW."""
+    try:
+        candidate = extract_mfcc_from_bytes(pcm_bytes)
+        dists = [dtw_distance(candidate, t) for t in verifier["templates"][:10]]
+        best  = min(dists)
+        return best <= verifier["threshold"]
+    except Exception:
+        return True   # If verifier errors, let OWW decision stand
 
 # ── Whisper model search ─────────────────────────────────────────────────────
 WHISPER_MODEL_CANDIDATES = [
@@ -148,15 +244,19 @@ def main() -> None:
     import pyaudio
     import numpy as np
 
-    # -- Try loading openwakeword -------------------------------------------------
+    # -- Custom verifier -------------------------------------------------
+    verifier = load_custom_verifier()
+    wake_label = "hey_sk" if verifier else "hey_jarvis"
+
+    # -- Try loading openwakeword ----------------------------------------
     oww = None
     try:
         from openwakeword.model import Model as OWWModel
-        # "hey_jarvis" is a pretrained model bundled with openwakeword
         oww = OWWModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-        log("openwakeword loaded (model: hey_jarvis)")
+        model_info = "hey_jarvis + custom Hey-SK verifier" if verifier else "hey_jarvis"
+        log(f"openwakeword loaded ({model_info})")
     except Exception as e:
-        log(f"openwakeword not available ({e}); falling back to keyword spotting")
+        log(f"openwakeword not available ({e}); falling back to energy detection")
 
     # -- Whisper model -------------------------------------------------------
     model_path = find_whisper_model()
@@ -188,13 +288,19 @@ def main() -> None:
         triggered = False
 
         if oww is not None:
-            # openwakeword path
+            # openwakeword base detection
             try:
                 audio_np = np.frombuffer(raw, dtype=np.int16)
                 scores = oww.predict(audio_np)
-                # scores is dict: {"hey_jarvis": float}
                 if scores.get("hey_jarvis", 0.0) >= WAKE_THRESHOLD:
-                    triggered = True
+                    # Second stage: DTW verifier (if custom model trained)
+                    if verifier:
+                        # Collect ~1 sec of recent audio for DTW check
+                        if not triggered:
+                            if verify_with_dtw(raw, verifier):
+                                triggered = True
+                    else:
+                        triggered = True
             except Exception:
                 pass
         else:
@@ -224,7 +330,8 @@ def main() -> None:
 
             time.sleep(0.3)
             listen_stream.start_stream()
-            emit("ready", "SK is listening for 'Hey SK'…")
+            wake_phrase = "'Hey SK'" if verifier else "'Hey Jarvis' (train 'Hey SK' in settings)"
+        emit("ready", f"SK is listening for {wake_phrase}…")
 
     listen_stream.stop_stream()
     listen_stream.close()

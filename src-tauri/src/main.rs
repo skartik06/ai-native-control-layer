@@ -3688,6 +3688,103 @@ fn uninstall_sk_service(app: AppHandle) -> Result<String, String> {
     Err("systemd service is available on Linux only.".to_string())
 }
 
+// ── Phase 6: Custom wake word ────────────────────────────────────────────────
+
+fn daemon_script_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("../../../sk-daemon")))
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .unwrap_or_else(|| std::path::PathBuf::from("sk-daemon"))
+}
+
+#[tauri::command]
+fn get_wake_word_model_status() -> serde_json::Value {
+    let home = env::var("HOME").unwrap_or_default();
+    let verifier = std::path::PathBuf::from(&home)
+        .join(".local/share/ai-native-control-layer/hey_sk_verifier.npz");
+    let samples_dir = std::path::PathBuf::from(&home)
+        .join(".local/share/ai-native-control-layer/hey_sk_samples");
+    let sample_count = fs::read_dir(&samples_dir)
+        .map(|dir| dir.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    serde_json::json!({
+        "custom_model_exists": verifier.exists(),
+        "verifier_path": verifier.to_string_lossy(),
+        "sample_count": sample_count,
+        "samples_dir": samples_dir.to_string_lossy(),
+    })
+}
+
+#[tauri::command]
+fn record_wake_word_sample(sample_num: u8, app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let script = daemon_script_dir().join("record_wake_word.py");
+        if !script.exists() {
+            return Err(format!("record_wake_word.py not found at {}", script.display()));
+        }
+        let mut child = std::process::Command::new("python3")
+            .arg(&script)
+            .arg("--sample-num")
+            .arg(sample_num.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Could not start recorder: {e}"))?;
+
+        let stdout = child.stdout.take().ok_or("No stdout".to_string())?;
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let _ = app_clone.emit("sk://recording", &msg);
+            }
+            let _ = child.wait();
+        });
+        Ok(format!("Recording sample {sample_num}…"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err("Wake word recording is available on Linux only.".to_string())
+}
+
+#[tauri::command]
+fn train_wake_word(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let script = daemon_script_dir().join("train_wake_word.py");
+        if !script.exists() {
+            return Err(format!("train_wake_word.py not found at {}", script.display()));
+        }
+        let mut child = std::process::Command::new("python3")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Could not start trainer: {e}"))?;
+
+        let stdout = child.stdout.take().ok_or("No stdout".to_string())?;
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let _ = app_clone.emit("sk://training", &msg);
+            }
+            let _ = child.wait();
+            let _ = app_clone.emit("sk://training", serde_json::json!({
+                "type": "finished", "text": "Training complete.", "progress": 100
+            }));
+        });
+        Ok("Training started…".to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err("Wake word training is available on Linux only.".to_string())
+}
+
 /// On app startup: if the systemd service is already running (daemon started at boot),
 /// tail the log file and forward new lines as sk://daemon events to the frontend.
 pub fn boot_autostart_connect(app: AppHandle) {
@@ -3772,7 +3869,10 @@ fn main() {
             get_daemon_running,
             get_sk_service_status,
             install_sk_service,
-            uninstall_sk_service
+            uninstall_sk_service,
+            get_wake_word_model_status,
+            record_wake_word_sample,
+            train_wake_word
         ])
         .setup(|app| {
             // If sk-daemon systemd service is already running (boot autostart),

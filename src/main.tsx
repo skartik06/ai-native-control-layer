@@ -51,6 +51,16 @@ function App() {
   const [showMemory, setShowMemory] = useState(false);
   const [showReminders, setShowReminders] = useState(false);
   const [showNetworks, setShowNetworks] = useState(false);
+  const [showTrainWizard, setShowTrainWizard] = useState(false);
+
+  // Wake word training
+  const [wakeWordModelExists, setWakeWordModelExists] = useState(false);
+  const [wakeWordSampleCount, setWakeWordSampleCount] = useState(0);
+  const [trainingStep, setTrainingStep] = useState<"idle"|"recording"|"training"|"done">("idle");
+  const [trainingProgress, setTrainingProgress] = useState(0);
+  const [trainingLog, setTrainingLog] = useState("");
+  const [recordingCountdown, setRecordingCountdown] = useState(0);
+  const TOTAL_SAMPLES = 5;
 
   // Audit history
   const [history, setHistory] = useState<AuditEntry[] | null>(null);
@@ -142,8 +152,74 @@ function App() {
           }
         })
         .catch(() => {});
+      void invoke<{ custom_model_exists: boolean; sample_count: number }>("get_wake_word_model_status")
+        .then((m) => {
+          setWakeWordModelExists(m.custom_model_exists);
+          setWakeWordSampleCount(m.sample_count);
+        })
+        .catch(() => {});
     });
   }, []);
+
+  // Training event listeners (sk://recording, sk://training)
+  useEffect(() => {
+    if (!isTauri) return;
+    let u1: (() => void) | undefined;
+    let u2: (() => void) | undefined;
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen<{ type: string; text: string; progress?: number; count?: number; sample_num?: number }>
+      ("sk://recording", (e) => {
+        const { type, text, count, sample_num } = e.payload;
+        setTrainingLog(text);
+        if (count !== undefined) setRecordingCountdown(count);
+        if (type === "done") {
+          setTrainingStep("idle");
+          setWakeWordSampleCount((n) => Math.max(n, sample_num ?? 0));
+        }
+      }).then(fn => { u1 = fn; });
+
+      listen<{ type: string; text: string; progress?: number }>("sk://training", (e) => {
+        const { type, text, progress } = e.payload;
+        setTrainingLog(text);
+        if (progress !== undefined) setTrainingProgress(progress);
+        if (type === "done" || type === "finished") {
+          setTrainingStep("done");
+          setWakeWordModelExists(true);
+          setTrainingProgress(100);
+        }
+        if (type === "error") setTrainingStep("idle");
+      }).then(fn => { u2 = fn; });
+    });
+    return () => { u1?.(); u2?.(); };
+  }, []);
+
+  async function recordSample(num: number) {
+    if (!isTauri) return;
+    setTrainingStep("recording");
+    setTrainingLog(`Get ready to say 'Hey SK'…`);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke<string>("record_wake_word_sample", { sampleNum: num });
+    } catch (err) {
+      setTrainingLog(`Recording error: ${String(err)}`);
+      setTrainingStep("idle");
+    }
+  }
+
+  async function startTraining() {
+    if (!isTauri) return;
+    setTrainingStep("training");
+    setTrainingProgress(0);
+    setTrainingLog("Starting training…");
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke<string>("train_wake_word");
+    } catch (err) {
+      setTrainingLog(`Training error: ${String(err)}`);
+      setTrainingStep("idle");
+    }
+  }
+
 
   useEffect(() => {
     const onEscape = (e: KeyboardEvent) => {
@@ -716,6 +792,18 @@ function App() {
             >
               {serviceInstalled ? "🚀 Boot: ON" : "🚀 Boot: OFF"}
             </button>
+            {/* Train Hey SK */}
+            <button
+              id="train-wake-word-btn"
+              className={`cap-badge cap-toggle ${wakeWordModelExists ? "cap-active" : ""}`}
+              type="button"
+              onClick={() => setShowTrainWizard((v) => !v)}
+              title={wakeWordModelExists
+                ? "Custom 'Hey SK' model active — click to retrain"
+                : "Train SK to recognise your voice for 'Hey SK'"}
+            >
+              {wakeWordModelExists ? "🎤 Hey SK: trained" : "🎤 Train Hey SK"}
+            </button>
           </div>
           {/* Daemon / service status line */}
           {(daemonRunning || daemonStatus !== "Voice daemon off") && (
@@ -723,6 +811,80 @@ function App() {
               {serviceActive ? "⚡ " : ""}
               {daemonStatus}
             </p>
+          )}
+
+          {/* ── Training Wizard ── */}
+          {showTrainWizard && (
+            <div className="train-wizard">
+              <div className="train-wizard-header">
+                <span>🎤 Train your 'Hey SK' wake word</span>
+                <button type="button" className="close-btn"
+                  onClick={() => { setShowTrainWizard(false); setTrainingStep("idle"); }}>✕</button>
+              </div>
+
+              {trainingStep === "done" ? (
+                <div className="train-success">
+                  <p>✅ 'Hey SK' model trained successfully!</p>
+                  <p className="train-hint">Restart the voice daemon to activate your custom wake word.</p>
+                </div>
+              ) : (
+                <>
+                  {/* Sample recorder */}
+                  <p className="train-hint">
+                    Say <strong>'Hey SK'</strong> clearly for each sample.
+                    Recorded: <strong>{wakeWordSampleCount}/{TOTAL_SAMPLES}</strong>
+                  </p>
+                  <div className="train-samples">
+                    {Array.from({ length: TOTAL_SAMPLES }, (_, i) => i + 1).map((n) => (
+                      <button
+                        key={n}
+                        type="button"
+                        className={`sample-btn ${wakeWordSampleCount >= n ? "sample-done" : ""} ${trainingStep === "recording" ? "sample-busy" : ""}`}
+                        onClick={() => trainingStep === "idle" && recordSample(n)}
+                        disabled={trainingStep !== "idle"}
+                        title={wakeWordSampleCount >= n ? `Sample ${n} recorded ✓` : `Record sample ${n}`}
+                      >
+                        {wakeWordSampleCount >= n ? "✓" : n}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Live status */}
+                  {trainingLog && (
+                    <p className="train-status">
+                      {trainingStep === "recording" && recordingCountdown > 0
+                        ? `🔴 Recording in ${recordingCountdown}…`
+                        : trainingLog}
+                    </p>
+                  )}
+
+                  {/* Training controls */}
+                  {trainingStep === "training" && (
+                    <div className="train-progress">
+                      <div className="progress-bar">
+                        <div className="progress-fill" style={{ width: `${trainingProgress}%` }} />
+                      </div>
+                      <span className="progress-label">{trainingProgress}%</span>
+                    </div>
+                  )}
+
+                  <div className="train-actions">
+                    <button
+                      type="button"
+                      className="train-start-btn"
+                      onClick={startTraining}
+                      disabled={wakeWordSampleCount < 1 || trainingStep !== "idle"}
+                    >
+                      {trainingStep === "training"
+                        ? "Training…"
+                        : wakeWordSampleCount < 1
+                        ? "Record at least 1 sample first"
+                        : `Train model (${wakeWordSampleCount} sample${wakeWordSampleCount !== 1 ? "s" : ""})`}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           )}
         </section>
 
