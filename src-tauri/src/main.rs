@@ -3559,6 +3559,178 @@ fn start_sk_daemon(daemon: State<'_, DaemonHandle>, app: AppHandle) -> Result<St
     Ok("SK voice daemon started.".to_string())
 }
 
+// ── SK systemd service management ────────────────────────────────────────────
+
+/// Returns the well-known log file path written by the systemd service.
+fn sk_voice_log_path() -> std::path::PathBuf {
+    let home = env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join(".local/share/ai-native-control-layer/sk-voice.log")
+}
+
+/// Returns the user systemd service directory.
+fn systemd_user_dir() -> std::path::PathBuf {
+    let home = env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".config/systemd/user")
+}
+
+#[tauri::command]
+fn get_sk_service_status() -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    {
+        let is_active = Command::new("systemctl")
+            .args(["--user", "is-active", "sk-daemon"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let is_enabled = Command::new("systemctl")
+            .args(["--user", "is-enabled", "sk-daemon"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let service_installed = systemd_user_dir().join("sk-daemon.service").exists();
+        return serde_json::json!({
+            "installed": service_installed,
+            "active":    is_active,
+            "enabled":   is_enabled,
+            "log_path":  sk_voice_log_path().to_string_lossy(),
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    serde_json::json!({"installed": false, "active": false, "enabled": false})
+}
+
+#[tauri::command]
+fn install_sk_service(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        // Find the daemon script
+        let daemon_script = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("../../../sk-daemon/sk_daemon.py")))
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .unwrap_or_else(|| std::path::PathBuf::from("sk-daemon/sk_daemon.py"));
+
+        if !daemon_script.exists() {
+            return Err("sk_daemon.py not found. Clone the full project first.".to_string());
+        }
+
+        let log_path = sk_voice_log_path();
+        let service_dir = systemd_user_dir();
+        fs::create_dir_all(&service_dir)
+            .map_err(|e| format!("Could not create systemd user dir: {e}"))?;
+        fs::create_dir_all(log_path.parent().unwrap())
+            .map_err(|e| format!("Could not create data dir: {e}"))?;
+
+        let unit = format!(
+            "[Unit]\n\
+             Description=SK Voice Daemon \u2014 always-on wake word and STT pipeline\n\
+             Documentation=https://github.com/skartik06/ai-native-control-layer\n\
+             After=sound.target graphical-session.target\n\
+             PartOf=graphical-session.target\n\n\
+             [Service]\n\
+             Type=simple\n\
+             ExecStart=/usr/bin/python3 {script} --log-file {log}\n\
+             Restart=on-failure\n\
+             RestartSec=5s\n\
+             SupplementaryGroups=audio\n\n\
+             [Install]\n\
+             WantedBy=default.target\n",
+            script = daemon_script.display(),
+            log    = log_path.display(),
+        );
+
+        let service_path = service_dir.join("sk-daemon.service");
+        fs::write(&service_path, unit)
+            .map_err(|e| format!("Could not write service file: {e}"))?;
+
+        // systemctl --user daemon-reload
+        Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .map_err(|e| format!("daemon-reload failed: {e}"))?;
+
+        // Enable + start
+        Command::new("systemctl")
+            .args(["--user", "enable", "--now", "sk-daemon"])
+            .status()
+            .map_err(|e| format!("enable --now failed: {e}"))?;
+
+        // Emit startup event to frontend
+        let _ = app.emit("sk://service", serde_json::json!({
+            "type": "installed",
+            "text": "SK voice service installed and enabled at boot."
+        }));
+
+        Ok(format!("SK voice daemon installed as systemd user service and enabled at boot.\nLog: {}", log_path.display()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err("systemd service is available on Linux only.".to_string())
+}
+
+#[tauri::command]
+fn uninstall_sk_service(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "sk-daemon"])
+            .status();
+        let service_path = systemd_user_dir().join("sk-daemon.service");
+        let _ = fs::remove_file(&service_path);
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        let _ = app.emit("sk://service", serde_json::json!({
+            "type": "uninstalled",
+            "text": "SK voice service removed from boot startup."
+        }));
+        Ok("SK voice daemon service uninstalled.".to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err("systemd service is available on Linux only.".to_string())
+}
+
+/// On app startup: if the systemd service is already running (daemon started at boot),
+/// tail the log file and forward new lines as sk://daemon events to the frontend.
+pub fn boot_autostart_connect(app: AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        let log_path = sk_voice_log_path();
+        if !log_path.exists() { return; }
+
+        // Check if systemd service is active
+        let active = Command::new("systemctl")
+            .args(["--user", "is-active", "sk-daemon"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !active { return; }
+
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            use std::io::{Seek, SeekFrom};
+            let Ok(mut file) = std::fs::OpenOptions::new().read(true).open(&log_path) else { return; };
+            // Start from end of file — we only want new events
+            let _ = file.seek(SeekFrom::End(0));
+            let _ = app_clone.emit("sk://daemon", serde_json::json!({
+                "type": "ready",
+                "text": "SK voice daemon running (systemd boot service)."
+            }));
+            let _ = app_clone.emit("sk://service", serde_json::json!({
+                "type": "connected",
+                "text": "Connected to systemd sk-daemon service."
+            }));
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let _ = app_clone.emit("sk://daemon", &msg);
+                if msg.get("type").and_then(|t| t.as_str()) == Some("command") {
+                    if let Some(text) = msg.get("text").and_then(|t| t.as_str()) {
+                        let _ = app_clone.emit("sk://voice-command", serde_json::json!({"text": text}));
+                    }
+                }
+            }
+        });
+    }
+}
 
 fn main() {
     tauri::Builder::default()
@@ -3597,8 +3769,17 @@ fn main() {
             get_whisper_model_path,
             start_sk_daemon,
             stop_sk_daemon,
-            get_daemon_running
+            get_daemon_running,
+            get_sk_service_status,
+            install_sk_service,
+            uninstall_sk_service
         ])
+        .setup(|app| {
+            // If sk-daemon systemd service is already running (boot autostart),
+            // connect to it immediately so voice commands work on app open.
+            boot_autostart_connect(app.handle().clone());
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running SK");
 }

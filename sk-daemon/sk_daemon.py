@@ -23,9 +23,11 @@ import os
 import wave
 import signal
 import struct
+import argparse
 
 # ── Graceful shutdown ────────────────────────────────────────────────────────
 _running = True
+_log_file = None  # Optional file handle for systemd log output
 
 def _handle_sigterm(signum, frame):
     global _running
@@ -36,7 +38,14 @@ signal.signal(signal.SIGINT,  _handle_sigterm)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def emit(type_: str, text: str = "") -> None:
-    print(json.dumps({"type": type_, "text": text}), flush=True)
+    msg = json.dumps({"type": type_, "text": text})
+    print(msg, flush=True)
+    if _log_file:
+        try:
+            _log_file.write(msg + "\n")
+            _log_file.flush()
+        except Exception:
+            pass
 
 def log(msg: str) -> None:
     emit("log", msg)
@@ -122,6 +131,20 @@ def _rms(chunk_bytes: bytes) -> float:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
+    global _log_file
+
+    parser = argparse.ArgumentParser(description="SK Voice Daemon")
+    parser.add_argument("--log-file", default="",
+                        help="Also write JSON events to this file (for systemd mode)")
+    args = parser.parse_args()
+
+    if args.log_file:
+        try:
+            os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
+            _log_file = open(args.log_file, "a", encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: could not open log file {args.log_file}: {e}", flush=True)
+
     import pyaudio
     import numpy as np
 

@@ -100,6 +100,8 @@ function App() {
   // SK Voice Daemon
   const [daemonRunning, setDaemonRunning] = useState(false);
   const [daemonStatus, setDaemonStatus] = useState("Voice daemon off");
+  const [serviceInstalled, setServiceInstalled] = useState(false);
+  const [serviceActive, setServiceActive] = useState(false);
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
 
@@ -130,6 +132,16 @@ function App() {
       void invoke<VoiceStatus>("get_voice_status").then(setVoiceStatus).catch(() => {});
       void invoke<WakeWordStatus>("get_wake_word_status").then(setWakeWordStatus).catch(() => {});
       void invoke<string[]>("get_installed_models").then(setInstalledModels).catch(() => {});
+      void invoke<{ installed: boolean; active: boolean; enabled: boolean }>("get_sk_service_status")
+        .then((s) => {
+          setServiceInstalled(s.installed);
+          setServiceActive(s.active);
+          if (s.active) {
+            setDaemonRunning(true);
+            setDaemonStatus("SK voice daemon running (boot service)");
+          }
+        })
+        .catch(() => {});
     });
   }, []);
 
@@ -223,6 +235,28 @@ function App() {
       }
     } catch (err) {
       setDaemonStatus(`Daemon error: ${String(err)}`);
+    }
+  }
+
+  async function toggleService() {
+    if (!isTauri) return;
+    const { invoke } = await import("@tauri-apps/api/core");
+    try {
+      if (serviceInstalled) {
+        await invoke<string>("uninstall_sk_service");
+        setServiceInstalled(false);
+        setServiceActive(false);
+        setDaemonRunning(false);
+        setDaemonStatus("Boot service removed");
+      } else {
+        const msg = await invoke<string>("install_sk_service");
+        setServiceInstalled(true);
+        setServiceActive(true);
+        setDaemonRunning(true);
+        setDaemonStatus(msg.split("\n")[0]);
+      }
+    } catch (err) {
+      setDaemonStatus(`Service error: ${String(err)}`);
     }
   }
 
@@ -663,17 +697,32 @@ function App() {
             {/* Voice Daemon toggle */}
             <button
               id="voice-daemon-toggle"
-              className={`cap-badge cap-toggle ${daemonRunning ? "cap-active" : ""}`}
+              className={`cap-badge cap-toggle ${daemonRunning && !serviceActive ? "cap-active" : ""}`}
               type="button"
               onClick={toggleDaemon}
               title={daemonRunning ? `${daemonStatus} — click to stop` : "Start SK voice daemon (say 'Hey SK' to activate)"}
             >
-              {daemonRunning ? "👂 SK listening" : "👂 Voice daemon"}
+              {daemonRunning && !serviceActive ? "👂 SK listening" : "👂 Voice daemon"}
+            </button>
+            {/* Boot autostart toggle */}
+            <button
+              id="boot-service-toggle"
+              className={`cap-badge cap-toggle ${serviceInstalled ? "cap-active" : ""}`}
+              type="button"
+              onClick={toggleService}
+              title={serviceInstalled
+                ? "SK starts at login (click to disable)"
+                : "Enable SK to start automatically at login"}
+            >
+              {serviceInstalled ? "🚀 Boot: ON" : "🚀 Boot: OFF"}
             </button>
           </div>
-          {/* Daemon status line */}
-          {daemonRunning && (
-            <p className="daemon-status">{daemonStatus}</p>
+          {/* Daemon / service status line */}
+          {(daemonRunning || daemonStatus !== "Voice daemon off") && (
+            <p className="daemon-status">
+              {serviceActive ? "⚡ " : ""}
+              {daemonStatus}
+            </p>
           )}
         </section>
 

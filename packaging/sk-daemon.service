@@ -1,0 +1,22 @@
+[Unit]
+Description=SK Voice Daemon — always-on wake word and STT pipeline
+Documentation=https://github.com/skartik06/ai-native-control-layer
+After=sound.target graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# SK_PROJECT_DIR is set by the install script
+ExecStart=/usr/bin/env python3 %h/.local/share/ai-native-control-layer/run-sk-daemon.sh
+Restart=on-failure
+RestartSec=5s
+
+# Write JSON events to a well-known path so the Tauri app can tail it
+Environment=SK_LOG_FILE=%h/.local/share/ai-native-control-layer/sk-voice.log
+ExecStart=/usr/bin/env python3 %h/.local/share/sk/sk_daemon.py --log-file %h/.local/share/ai-native-control-layer/sk-voice.log
+
+# Audio access
+SupplementaryGroups=audio
+
+[Install]
+WantedBy=default.target
