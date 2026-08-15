@@ -182,12 +182,14 @@ def find_whisper_binary() -> str | None:
     return None
 
 def find_whisper_model() -> str | None:
-    # Also search snap data dir dynamically
+    # Walk ALL of ~/snap/whisper-cpp recursively (covers any revision number)
     snap_base = os.path.expanduser("~/snap/whisper-cpp")
     if os.path.isdir(snap_base):
-        for root, _, files in os.walk(snap_base):
+        for root, dirs, files in os.walk(snap_base):
+            # Skip hidden dirs
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
             for f in files:
-                if f == "ggml-base.en.bin":
+                if f.startswith("ggml-") and f.endswith(".bin"):
                     return os.path.join(root, f)
     for path in WHISPER_MODEL_CANDIDATES:
         if os.path.isfile(path):
@@ -277,20 +279,33 @@ def main() -> None:
     verifier = load_custom_verifier()
     wake_label = "hey_sk" if verifier else "hey_jarvis"
 
-    # -- Try loading openwakeword (handles v0.4 and v0.5+) ------------------
+    # -- Try loading openwakeword (v0.4, v0.5, v0.6 compatible) -------------
     oww = None
     oww_model_name = "hey_jarvis"
     try:
         from openwakeword.model import Model as OWWModel
-        import openwakeword
-        oww_version = tuple(int(x) for x in getattr(openwakeword, "__version__", "0.4.0").split(".")[:2])
+        import openwakeword as _oww_pkg
+        oww_version = tuple(
+            int(x) for x in
+            getattr(_oww_pkg, "__version__", "0.4.0").split(".")[:2]
+        )
 
-        if oww_version >= (0, 5):
-            # v0.5+ API: pass model list explicitly
-            oww = OWWModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-        else:
-            # v0.4 API: load without wakeword_models kwarg, uses bundled models
-            oww = OWWModel(inference_framework="onnx")
+        # Try API from most-to-least featured
+        _init_ok = False
+        for kwargs in [
+            {"wakeword_models": ["hey_jarvis"], "inference_framework": "onnx"},
+            {"inference_framework": "onnx"},
+            {},
+        ]:
+            try:
+                oww = OWWModel(**kwargs)
+                _init_ok = True
+                break
+            except TypeError:
+                continue
+
+        if not _init_ok:
+            raise RuntimeError("Could not initialise OWWModel")
 
         model_info = f"hey_jarvis v{oww_version[0]}.{oww_version[1]}"
         if verifier:
