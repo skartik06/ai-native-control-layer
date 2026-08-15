@@ -3622,7 +3622,7 @@ fn install_sk_service(app: AppHandle) -> Result<String, String> {
 
         let unit = format!(
             "[Unit]\n\
-             Description=SK Voice Daemon \u2014 always-on wake word and STT pipeline\n\
+             Description=SK Voice Daemon \u{2014} always-on wake word and STT pipeline\n\
              Documentation=https://github.com/skartik06/ai-native-control-layer\n\
              After=sound.target graphical-session.target\n\
              PartOf=graphical-session.target\n\n\
