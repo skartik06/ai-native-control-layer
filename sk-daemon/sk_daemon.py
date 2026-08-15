@@ -277,12 +277,24 @@ def main() -> None:
     verifier = load_custom_verifier()
     wake_label = "hey_sk" if verifier else "hey_jarvis"
 
-    # -- Try loading openwakeword ----------------------------------------
+    # -- Try loading openwakeword (handles v0.4 and v0.5+) ------------------
     oww = None
+    oww_model_name = "hey_jarvis"
     try:
         from openwakeword.model import Model as OWWModel
-        oww = OWWModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-        model_info = "hey_jarvis + custom Hey-SK verifier" if verifier else "hey_jarvis"
+        import openwakeword
+        oww_version = tuple(int(x) for x in getattr(openwakeword, "__version__", "0.4.0").split(".")[:2])
+
+        if oww_version >= (0, 5):
+            # v0.5+ API: pass model list explicitly
+            oww = OWWModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+        else:
+            # v0.4 API: load without wakeword_models kwarg, uses bundled models
+            oww = OWWModel(inference_framework="onnx")
+
+        model_info = f"hey_jarvis v{oww_version[0]}.{oww_version[1]}"
+        if verifier:
+            model_info += " + custom Hey-SK verifier"
         log(f"openwakeword loaded ({model_info})")
     except Exception as e:
         log(f"openwakeword not available ({e}); falling back to energy detection")
