@@ -154,13 +154,40 @@ def verify_with_dtw(pcm_bytes: bytes, verifier: dict) -> bool:
 
 # ── Whisper model search ─────────────────────────────────────────────────────
 WHISPER_MODEL_CANDIDATES = [
+    # snap install whisper-cpp  (most common on Ubuntu)
+    os.path.expanduser("~/snap/whisper-cpp/common/models/ggml-base.en.bin"),
+    os.path.expanduser("~/snap/whisper-cpp/current/models/ggml-base.en.bin"),
+    os.path.expanduser("~/snap/whisper-cpp/x1/models/ggml-base.en.bin"),
+    # manual / script install
     os.path.expanduser("~/.local/share/whisper/ggml-base.en.bin"),
     os.path.expanduser("~/.cache/whisper/ggml-base.en.bin"),
+    # system-wide
     "/usr/share/whisper/models/ggml-base.en.bin",
     "/usr/local/share/whisper/ggml-base.en.bin",
+    "/usr/share/whisper-cpp/models/ggml-base.en.bin",
 ]
 
+WHISPER_BINARIES = [
+    "whisper-cpp.cli",   # snap install whisper-cpp
+    "whisper-cli",       # whisper.cpp built from source
+    "whisper-cpp",       # some distros
+]
+
+def find_whisper_binary() -> str | None:
+    for binary in WHISPER_BINARIES:
+        result = subprocess.run(["which", binary], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return binary
+    return None
+
 def find_whisper_model() -> str | None:
+    # Also search snap data dir dynamically
+    snap_base = os.path.expanduser("~/snap/whisper-cpp")
+    if os.path.isdir(snap_base):
+        for root, _, files in os.walk(snap_base):
+            for f in files:
+                if f == "ggml-base.en.bin":
+                    return os.path.join(root, f)
     for path in WHISPER_MODEL_CANDIDATES:
         if os.path.isfile(path):
             return path
@@ -195,11 +222,12 @@ def record_audio(pa, seconds: int) -> str:
         wf.writeframes(b"".join(frames))
     return tmp.name
 
-# ── Transcribe with whisper-cli ───────────────────────────────────────────────
+# ── Transcribe with whisper-cpp ──────────────────────────────────────────────
 def transcribe(wav_path: str, model_path: str) -> str:
+    binary = find_whisper_binary() or "whisper-cpp.cli"
     try:
         cmd = [
-            "whisper-cli",
+            binary,
             "-m", model_path,
             "-f", wav_path,
             "--no-timestamps",
@@ -259,9 +287,15 @@ def main() -> None:
         log(f"openwakeword not available ({e}); falling back to energy detection")
 
     # -- Whisper model -------------------------------------------------------
+    whisper_bin = find_whisper_binary()
+    if not whisper_bin:
+        emit("error", "whisper-cpp not found. Run: sudo snap install whisper-cpp")
+        sys.exit(1)
+    log(f"Whisper binary: {whisper_bin}")
+
     model_path = find_whisper_model()
     if not model_path:
-        emit("error", "Whisper model not found. Run: whisper-cli --download-model base.en")
+        emit("error", "Whisper model not found. Run: whisper-cpp.download-ggml-model base.en")
         sys.exit(1)
     log(f"Whisper model: {model_path}")
 
