@@ -339,6 +339,9 @@ def main() -> None:
 
     emit("ready", "SK is listening for 'Hey SK'…")
 
+    # Determine wake phrase label once (before loop)
+    wake_phrase = "'Hey SK'" if verifier else "'Hey Jarvis' (train 'Hey SK' in settings)"
+
     global _running
     while _running:
         try:
@@ -357,23 +360,19 @@ def main() -> None:
                 if scores.get("hey_jarvis", 0.0) >= WAKE_THRESHOLD:
                     # Second stage: DTW verifier (if custom model trained)
                     if verifier:
-                        # Collect ~1 sec of recent audio for DTW check
-                        if not triggered:
-                            if verify_with_dtw(raw, verifier):
-                                triggered = True
+                        if verify_with_dtw(raw, verifier):
+                            triggered = True
                     else:
                         triggered = True
             except Exception:
                 pass
         else:
-            # Energy + keyword fallback — very basic, only works in quiet rooms
-            # Just a placeholder until openwakeword is installed
             pass  # daemon stays idle without wake word model
 
         if triggered:
             listen_stream.stop_stream()
             emit("wake", "Wake word detected — SK is listening…")
-            time.sleep(0.2)  # small gap before recording
+            time.sleep(0.2)
 
             emit("recording", f"Recording for {RECORD_SECONDS} seconds…")
             wav_path = record_audio(pa, RECORD_SECONDS)
@@ -392,8 +391,7 @@ def main() -> None:
 
             time.sleep(0.3)
             listen_stream.start_stream()
-            wake_phrase = "'Hey SK'" if verifier else "'Hey Jarvis' (train 'Hey SK' in settings)"
-        emit("ready", f"SK is listening for {wake_phrase}…")
+            emit("ready", f"SK is listening for {wake_phrase}…")
 
     listen_stream.stop_stream()
     listen_stream.close()
