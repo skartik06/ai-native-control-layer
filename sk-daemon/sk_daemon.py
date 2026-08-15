@@ -24,6 +24,7 @@ import wave
 import signal
 import struct
 import argparse
+import numpy as np   # needed by MFCC / DTW helpers at module level
 
 # ── Graceful shutdown ────────────────────────────────────────────────────────
 _running = True
